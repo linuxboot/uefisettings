@@ -28,6 +28,10 @@ test-vm = []
 test = false
 
 [[test]]
+name = "boot_manager"
+required-features = ["test-vm"]
+
+[[test]]
 name = "boot_smoke"
 required-features = ["test-vm"]
 
@@ -108,7 +112,15 @@ name = "hii_name_value_password"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_name_value_string"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_storageless_password"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_undeclared_password"
 required-features = ["test-vm"]
 
 [[test]]
@@ -124,11 +136,19 @@ name = "hii_formset_skip"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_form_set_disable_if"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_short_var_store"
 required-features = ["test-vm"]
 
 [[test]]
 name = "secboot"
+required-features = ["test-vm"]
+
+[[test]]
+name = "staged_set"
 required-features = ["test-vm"]
 
 [[test]]

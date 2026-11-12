@@ -1,0 +1,51 @@
+# The checks of shell/auth3-checks.nsh, the Shell boot of shell-auth3-checks: EnhancedAuthData,
+# EnhancedAuthRefused and EnhancedAuthNonce have the attributes 0x87. See check-shell-log.sh.
+# DmpStore shows each as seeded: 68 bytes of metadata and 4 of data, or 64 and 4 for the nonce
+dmpstore-before-data	status	any
+dmpstore-before-data	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000301:EnhancedAuthData' DataSize = 0x48$
+dmpstore-before-refused	status	any
+dmpstore-before-refused	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000301:EnhancedAuthRefused' DataSize = 0x48$
+dmpstore-before-nonce	status	any
+dmpstore-before-nonce	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000301:EnhancedAuthNonce' DataSize = 0x44$
+# variable info shows the metadata of the nonce-type variable, and why it refuses that of
+# Version 2, from the data that GetVariable() returns (UEFI 2.11 section 8.2.1)
+info-nonce	status	0x0
+info-nonce	json	. == {"variable": "EnhancedAuthNonce-8c78a505-baa0-4c4a-869f-000000000301", "attributes": 135, "size": 68, "metadata": {"version": 1, "type": 2, "metadata_size": 64, "flags": 0, "nonce": {"hex": "a5a5a5a5a5a5a5a5"}, "cert_id": {"type": 1, "id": {"hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}}}
+info-refused	status	0x0
+info-refused	json	. == {"variable": "EnhancedAuthRefused-8c78a505-baa0-4c4a-869f-000000000301", "attributes": 135, "size": 72, "metadata": {"refused": "EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1"}}
+# a TimeStamp that is not later than the variable's is refused before any write
+ts-equal	status	aborted
+ts-equal	json	. == {"error_message": "the TimeStamp 2026-11-06T12:00:00Z is not later than 2026-11-06T12:00:00Z, that of EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301, as the firmware requires (UEFI 2.11 section 8.2.5)"}
+ts-earlier	status	aborted
+ts-earlier	json	. == {"error_message": "the TimeStamp 2026-11-06T11:59:59Z is not later than 2026-11-06T12:00:00Z, that of EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301, as the firmware requires (UEFI 2.11 section 8.2.5)"}
+# a later one reaches SetVariable(), which this firmware refuses for the attribute
+ts-later	status	aborted
+ts-later	json	. == {"error_message": "SetVariable() of EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301: INVALID_PARAMETER"}
+# other attributes, another Type and metadata that uefisettings does not take are refused
+other-attributes	status	aborted
+other-attributes	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301 has the attributes NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | ENHANCED_AUTHENTICATED_ACCESS, not NON_VOLATILE | BOOTSERVICE_ACCESS | ENHANCED_AUTHENTICATED_ACCESS: SetVariable() refuses a rewrite with attributes other than these but APPEND_WRITE with EFI_INVALID_PARAMETER (UEFI 2.11 section 8.2.3)"}
+nonce-on-timestamp	status	aborted
+nonce-on-timestamp	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301 holds an EFI_VARIABLE_AUTHENTICATION_3 of Type TIMESTAMP (1), not NONCE (2), and the firmware verifies that the Types match (UEFI 2.11 section 8.2.5)"}
+refused-metadata	status	aborted
+refused-metadata	json	. == {"error_message": "EFI variable EnhancedAuthRefused-8c78a505-baa0-4c4a-869f-000000000301 holds EFI_VARIABLE_AUTHENTICATION_3 metadata that uefisettings does not take, so it cannot check the write against it: EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1"}
+# the variable's own nonce and a current nonce other than its own are refused
+nonce-held	status	aborted
+nonce-held	json	. == {"error_message": "the nonce is the one that EFI variable EnhancedAuthNonce-8c78a505-baa0-4c4a-869f-000000000301 holds, for which SetVariable() returns EFI_INVALID_PARAMETER (UEFI 2.11 sections 8.2.3 and 8.2.5)"}
+nonce-other-current	status	aborted
+nonce-other-current	json	. == {"error_message": "the current nonce given is not the one that EFI variable EnhancedAuthNonce-8c78a505-baa0-4c4a-869f-000000000301 holds, so the firmware would not verify the signature over it (UEFI 2.11 section 8.2.5)"}
+# another nonce without --current-nonce signs the variable's and reaches SetVariable()
+nonce-default	status	aborted
+nonce-default	json	. == {"error_message": "SetVariable() of EFI variable EnhancedAuthNonce-8c78a505-baa0-4c4a-869f-000000000301: INVALID_PARAMETER"}
+# a current nonce for a variable that does not exist is refused
+current-nonce-create	status	aborted
+current-nonce-create	json	. == {"error_message": "EFI variable EnhancedProbe-de145b29-c3cd-455f-91de-a76237b67c52 does not exist, so its create signs no current nonce (UEFI 2.11 section 8.2.5), and the firmware would not verify the signature over the one given"}
+# and every variable stays as it was, and EnhancedProbe absent
+dmpstore-after-data	status	any
+dmpstore-after-data	same	dmpstore-before-data
+dmpstore-after-refused	status	any
+dmpstore-after-refused	same	dmpstore-before-refused
+dmpstore-after-nonce	status	any
+dmpstore-after-nonce	same	dmpstore-before-nonce
+dmpstore-probe	status	any
+dmpstore-probe	line	No matching variables found
+dmpstore-probe	none	^Variable

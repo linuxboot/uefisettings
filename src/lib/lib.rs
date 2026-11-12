@@ -27,7 +27,11 @@ mod capsule_loader;
 mod capsule_services;
 #[cfg(target_os = "linux")]
 mod chattr;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+mod efi_status;
 mod efi_variables;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod esp;
 mod exit_status;
 pub mod exports;
 #[cfg(target_os = "linux")]
@@ -48,6 +52,15 @@ pub mod parse_error;
 #[cfg(target_os = "uefi")]
 mod runtime_time_services;
 pub mod secret_file;
+#[cfg(variable_data)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows builds stage a set for the next boot"
+    )
+)]
+mod staged_set;
 pub mod terminal_text;
 mod translation;
 #[cfg(target_os = "uefi")]

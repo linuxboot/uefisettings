@@ -22,6 +22,7 @@
 //! decoded bytes in freed memory, as pem-rfc7468 0.7 decodes into a plain Vec that der 0.7 drops
 //! on the error: accepted residuals.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -68,6 +69,7 @@ use x509_cert::spki::AlgorithmIdentifierOwned;
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
+use super::is_gmt_time_stamp;
 use super::CERTIFICATE_HEADER_SIZE;
 use super::EFI_CERT_TYPE_PKCS7_GUID;
 use super::EFI_TIME_SIZE;
@@ -76,6 +78,7 @@ use super::WIN_CERT_TYPE_EFI_GUID;
 use crate::efi_variables::enhanced_authenticated::authentication_3_payload;
 use crate::efi_variables::enhanced_authenticated::Freshness;
 use crate::efi_variables::enhanced_authenticated::MetadataTooLarge;
+use crate::efi_variables::GmtTime;
 use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 use crate::secret_file::Secret;
@@ -126,9 +129,19 @@ impl TimeStamp {
         ))
     }
 
+    /// The EFI_TIME `time` if in GMT, as the metadata of a variable holds it (UEFI 2.11 §8.2.1).
+    pub(crate) fn from_efi_time(time: [u8; EFI_TIME_SIZE]) -> Option<Self> {
+        is_gmt_time_stamp(&time).then_some(Self(time))
+    }
+
     /// The EFI_TIME.
     pub(crate) fn as_bytes(&self) -> &[u8; EFI_TIME_SIZE] {
         &self.0
+    }
+
+    /// The EFI_TIME, in GMT.
+    fn gmt_time(&self) -> GmtTime<'_> {
+        GmtTime(&self.0)
     }
 
     /// The EFI_TIME of `year` and its month, day, hour, minute and second, in GMT.
@@ -187,14 +200,25 @@ impl FromStr for TimeStamp {
     }
 }
 
+/// Chronological, as SetVariable() wants a TimeStamp "chronologically greater" than the variable's
+/// (UEFI 2.11 §8.2.5). It compares GmtTime::fields only, while the derived Eq compares all 16
+/// bytes: the two agree because every constructor (of, ZERO, from_efi_time) leaves Pad1 through
+/// Pad2 zero.
+impl Ord for TimeStamp {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.gmt_time().fields().cmp(&other.gmt_time().fields())
+    }
+}
+
+impl PartialOrd for TimeStamp {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl fmt::Display for TimeStamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [y0, y1, month, day, hour, minute, second, ..] = self.0;
-        let year = u16::from_le_bytes([y0, y1]);
-        write!(
-            f,
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-        )
+        self.gmt_time().fmt(f)
     }
 }
 
@@ -999,6 +1023,40 @@ pub(crate) mod tests {
             TimeStamp::from_system_time(UNIX_EPOCH - Duration::from_secs(1)),
             Err(TimeStampError::Clock),
             "before the epoch"
+        );
+    }
+
+    /// TimeStamps order chronologically, by Year as a number, then Month, Day, Hour, Minute and
+    /// Second, and from_efi_time takes an EFI_TIME in GMT only.
+    #[test]
+    fn time_stamps_order_chronologically() {
+        let stamp = |text: &str| text.parse::<TimeStamp>().expect("a test TimeStamp");
+        for (earlier, later) in [
+            ("2026-11-07T00:00:00Z", "2026-11-07T00:00:01Z"),
+            ("2026-11-07T00:00:59Z", "2026-11-07T00:01:00Z"),
+            ("2026-11-07T00:59:59Z", "2026-11-07T01:00:00Z"),
+            ("2026-11-06T23:59:59Z", "2026-11-07T00:00:00Z"),
+            ("2026-01-31T00:00:00Z", "2026-02-01T00:00:00Z"),
+            ("2026-12-31T23:59:59Z", "2027-01-01T00:00:00Z"),
+            ("2303-12-31T23:59:59Z", "2304-01-01T00:00:00Z"),
+        ] {
+            assert!(stamp(earlier) < stamp(later), "{earlier} before {later}");
+            assert!(stamp(later) > stamp(earlier), "{later} after {earlier}");
+        }
+        assert_eq!(
+            stamp(TIME).cmp(&stamp(TIME)),
+            Ordering::Equal,
+            "{TIME} and itself"
+        );
+
+        let gmt = TimeStamp::from_efi_time(*stamp(TIME).as_bytes());
+        let mut zoned = *stamp(TIME).as_bytes();
+        zoned[12] = 60;
+        assert_eq!(gmt, Some(stamp(TIME)), "{TIME} as an EFI_TIME");
+        assert_eq!(
+            TimeStamp::from_efi_time(zoned),
+            None,
+            "an EFI_TIME with a TimeZone"
         );
     }
 

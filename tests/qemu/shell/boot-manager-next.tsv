@@ -1,0 +1,7 @@
+# The checks of shell/boot-manager-next.nsh, the second UEFI Shell boot of boot-manager: the
+# firmware's boot manager loaded Boot009B, which BootNext named, and BootNext is gone. See
+# check-shell-log.sh.
+boot009b	status	0x0
+boot009b	firmware	.value as $v | .variable == "Boot009B-8be4df61-93ca-11d2-aa0d-00e098032b8c" and ($firmware | any(startswith("BdsDxe: loading Boot009B \"\($v.description)\" from ")))
+boot-next-gone	status	0x0
+boot-next-gone	json	. == {"variable": "BootNext-8be4df61-93ca-11d2-aa0d-00e098032b8c", "absent": true}

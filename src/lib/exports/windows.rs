@@ -18,11 +18,17 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::CapsuleBackend;
+use super::DriverHeldValues;
 use super::HiiBackend;
+use super::SetOptions;
+use super::UnsafeOperations;
 use super::VariableBackend;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfoSource;
 use crate::firmware_width::FirmwareWidth;
+use crate::hii::forms::IncludedStates;
+use crate::hii::forms::PasswordQuestions;
+use crate::hii::package;
 use crate::hii::package::db_file;
 use crate::hii::read_hiidb;
 use crate::hii::EfivarSource;
@@ -30,6 +36,7 @@ use crate::hii::FirmwareEnvironment;
 use crate::hii::FirmwareVariables;
 use crate::hii::RealFirmwareEnvironmentCalls;
 use crate::hii::VariableReach;
+use crate::staged_set::next_boot::NextBootStaging;
 
 /// What set and get read and write when no file names them: this machine's HiiDB, through
 /// the HiiDB driver, and its firmware environment variables.
@@ -89,5 +96,36 @@ impl HiiBackend {
                 EfivarSource::System | EfivarSource::Disabled => Self::system_hiidb(),
             },
         }
+    }
+}
+
+/// What get and set do with a question whose driver holds its value: get reaches no driver here,
+/// and shows what the records of staged sets tell of it, which this machine's firmware
+/// environment variables hold; set stages it for the next boot.
+impl HiiBackend {
+    pub(super) fn driver_held_values(
+        _hiidb: &[u8],
+        efivars: &EfivarSource,
+    ) -> Option<Box<dyn DriverHeldValues>> {
+        match efivars {
+            EfivarSource::System => Some(Box::new(NextBootStaging {
+                image: None,
+                esp: None,
+                include: IncludedStates::empty(),
+                assume_var_stores: Vec::new(),
+                unsafe_operations: UnsafeOperations::Refuse,
+                // get writes nothing
+                passwords: PasswordQuestions::default(),
+            })),
+            EfivarSource::Disabled => None,
+        }
+    }
+
+    pub(super) fn driver_held_setter(
+        hiidb: &[u8],
+        options: &SetOptions,
+    ) -> Result<Option<Box<dyn DriverHeldValues>>> {
+        let lists = package::read_db(hiidb)?;
+        Ok(Some(Box::new(NextBootStaging::of(options, &lists))))
     }
 }

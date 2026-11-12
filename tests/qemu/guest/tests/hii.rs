@@ -375,6 +375,116 @@ fn list_questions_lists_ordered_lists_with_their_items() {
     );
 }
 
+/// The efivar file of DriverSample's MyIfrNVData, as --assume-var-store names it.
+const MY_IFR_NV_DATA: &str = "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d";
+/// The byte of SuppressGrayOutSomething in MyIfrNVData (NVDataStruc.h, edk2-stable202608), which
+/// the one-of "My one-of prompt #1" holds, 2 as DriverSample stores it.
+const SUPPRESS_GRAY_OUT_SOMETHING_OFFSET: usize = 93;
+
+/// Stating 00 for SuppressGrayOutSomething, which DriverSample holds as 2, changes the states that
+/// list-questions lists: "Pick 1", which a DISABLE_IF on 2 disables, shows without --include, and
+/// "Boot Order", which a SUPPRESS_IF on 0 hides, does not; the variable and the one-of on that
+/// byte keep 2.
+#[test]
+fn list_questions_reads_stated_var_store_bytes() {
+    let before = variable_data(DRIVER_SAMPLE_VARIABLE).expect("the variable does not exist");
+    assert_eq!(
+        before[SUPPRESS_GRAY_OUT_SOMETHING_OFFSET], 2,
+        "DriverSample stores 2"
+    );
+    let listed = |flags: &[&str]| -> Vec<Question> {
+        json(&[&["hii", "list-questions", "--json"][..], flags].concat())
+    };
+    let names = |questions: &[Question]| -> Vec<String> {
+        questions
+            .iter()
+            .filter(|question| question.items.is_some())
+            .map(|question| question.name.clone())
+            .collect()
+    };
+    // MyOneOf, the first question of that prompt
+    let one_of = |questions: &[Question]| -> Option<String> {
+        questions
+            .iter()
+            .find(|question| question.name == ONE_OF_PROMPT)
+            .map(|question| question.answer.clone())
+    };
+    let statement = format!("{MY_IFR_NV_DATA}+{SUPPRESS_GRAY_OUT_SOMETHING_OFFSET}=00");
+    let stored = listed(&[]);
+    let stated = listed(&["--assume-var-store", &statement]);
+    assert_eq!(
+        names(&stored),
+        [BOOT_ORDER, "Get Call Back default"],
+        "the ordered lists as DriverSample stores 2"
+    );
+    assert_eq!(
+        names(&stated),
+        [PICK_1, "Get Call Back default"],
+        "the ordered lists with 00 stated"
+    );
+    assert_eq!(one_of(&stated), one_of(&stored), "the answer of MyOneOf");
+    assert!(one_of(&stored).is_some(), "MyOneOf listed");
+    assert_eq!(
+        variable_data(DRIVER_SAMPLE_VARIABLE),
+        Some(before),
+        "MyIfrNVData unchanged"
+    );
+}
+
+/// The "BIT numeric" on DriverSample's MyEfiBitVar, which lacks runtime access, is grayed out
+/// while its bit field EfiBitGrayoutTest is 0 (Vfr.vfr, edk2-stable202608): from Linux that is
+/// undetermined, naming the flag that states the byte of the field; stated bytes decide it, and
+/// its answer stays the reason why it has no value.
+#[test]
+fn a_stated_bit_field_decides_a_condition() {
+    let efi_bit_numeric = |flags: &[&str]| -> Vec<String> {
+        let questions: Vec<Question> = json(
+            &[
+                &["hii", "list-questions", "--json"][..],
+                &INCLUDE_GRAYED_OUT,
+                flags,
+            ]
+            .concat(),
+        );
+        questions
+            .into_iter()
+            .filter(|question| {
+                question.name == "BIT numeric" && question.answer.contains("MyEfiBitVar")
+            })
+            .map(|question| question.answer)
+            .collect()
+    };
+    let unread =
+        "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d \
+                  is not present at OS runtime: efivarfs does not list it, and its form declares \
+                  it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: 4>";
+    let [undetermined] = <[String; 1]>::try_from(efi_bit_numeric(&[]))
+        .unwrap_or_else(|got| panic!("one BIT numeric on MyEfiBitVar: {got:?}"));
+    assert!(
+        undetermined.starts_with(&format!("{unread} <selectable or grayed-out: ")),
+        "{undetermined}"
+    );
+    assert!(
+        undetermined.ends_with(
+            "; --assume-var-store MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d+4=<HEX of 1 \
+             byte> states it>>"
+        ),
+        "{undetermined}"
+    );
+    let stated = |byte: &str| {
+        efi_bit_numeric(&[
+            "--assume-var-store",
+            &format!("MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d+4={byte}"),
+        ])
+    };
+    assert_eq!(
+        stated("e0"),
+        [format!("{unread} <grayed-out>")],
+        "EfiBitGrayoutTest 0"
+    );
+    assert_eq!(stated("01"), [unread.to_string()], "EfiBitGrayoutTest 1");
+}
+
 /// get shows the EFI_HII_REF that DriverSample's cross-reference question UPDATE_DEST holds at
 /// RefData of its variable: its QuestionId, FormId and FormSetGuid, and its DevicePath, none for
 /// string 0, else the text of that string, quoted. A SUPPRESS_IF hides its form.

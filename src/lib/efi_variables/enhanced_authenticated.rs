@@ -30,6 +30,12 @@
 #[cfg(variable_data)]
 use std::str::FromStr;
 
+#[cfg(variable_info)]
+use serde::ser::SerializeMap;
+#[cfg(variable_info)]
+use serde::Serialize;
+#[cfg(variable_info)]
+use serde::Serializer;
 use thiserror::Error;
 
 #[cfg(variable_data)]
@@ -43,6 +49,10 @@ use super::authenticated::WIN_CERT_REVISION;
 #[cfg(variable_data)]
 use super::authenticated::WIN_CERT_TYPE_EFI_GUID;
 use super::is_gmt_time_stamp;
+#[cfg(variable_info)]
+use super::json_bytes::Hex;
+#[cfg(variable_info)]
+use super::GmtTime;
 use super::EFI_TIME_SIZE;
 #[cfg(variable_data)]
 use crate::hex_digits::hex_bytes;
@@ -72,6 +82,8 @@ const NONCE_HEADER_SIZE: usize = UINT32_SIZE;
 /// is aligned to its UINT32 IdSize, and a WIN_CERTIFICATE_UEFI_GUID on SetVariable() to the UINT32
 /// dwLength of its Hdr and the UINT32 Data1 of its CertType.
 const CERTIFICATE_ALIGNMENT: usize = UINT32_SIZE;
+/// The Flags of the metadata that GetVariable() returns: none, as all are reserved there.
+const GET_VARIABLE_FLAGS: u32 = 0;
 /// EFI_VARIABLE_ENHANCED_AUTH_FLAG_UPDATE_CERT, "the only defined value" of Flags on SetVariable()
 /// (UEFI 2.11 §8.2.3): a NewCert precedes the SigningCert.
 #[cfg(variable_data)]
@@ -87,7 +99,7 @@ const CERT_ID_SHA256: u8 = 1;
 const SHA256_DIGEST_SIZE: usize = 32;
 
 /// Why the EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable is refused.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
 pub(crate) enum MetadataRefusal {
     #[error(
         "it also has EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which SetVariable() \
@@ -145,16 +157,62 @@ pub(crate) fn has_metadata(attributes: u32) -> Result<bool, MetadataRefusal> {
 /// after its metadata (has_metadata), else at 0.
 pub(crate) fn metadata_end(attributes: u32, data: &[u8]) -> Result<usize, MetadataRefusal> {
     match has_metadata(attributes)? {
-        true => authentication_3_metadata_size(data),
+        true => authentication_3_metadata(data).map(|metadata| metadata.size),
         false => Ok(0),
     }
 }
 
-/// The size of the metadata that starts `data`, checked strictly: Version 1, Flags 0, a
+/// The EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable, as GetVariable() returns it before
+/// the value (UEFI 2.11 §8.2.1), which authentication_3_metadata takes only of Version 1 and
+/// Flags 0.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Metadata {
+    /// Its size: where the value starts, and its MetadataSize
+    pub(crate) size: usize,
+    /// Its Secondary Descriptor, of its Type
+    #[cfg_attr(
+        not(any(variable_data, variable_info)),
+        allow(
+            dead_code,
+            reason = "only the signed writes and variable info of builds with VariableData and \
+                      VariableInfo read it"
+        )
+    )]
+    pub(crate) freshness: StoredFreshness,
+    /// The Id of its EFI_VARIABLE_AUTHENTICATION_3_CERT_ID, of CERT_ID_SHA256
+    #[cfg_attr(
+        not(variable_info),
+        allow(
+            dead_code,
+            reason = "only variable info of builds with VariableInfo reads it"
+        )
+    )]
+    pub(crate) cert_id: [u8; SHA256_DIGEST_SIZE],
+}
+
+/// The Secondary Descriptor in the metadata of a variable (UEFI 2.11 §8.2.1), against which the
+/// firmware checks the next write (§8.2.5).
+#[cfg_attr(
+    not(any(variable_data, variable_info)),
+    allow(
+        dead_code,
+        reason = "only the signed writes and variable info of builds with VariableData and \
+                  VariableInfo read it"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum StoredFreshness {
+    /// EFI_VARIABLE_AUTHENTICATION_3_TIMESTAMP_TYPE: the variable's EFI_TIME, in GMT
+    TimeStamp([u8; EFI_TIME_SIZE]),
+    /// EFI_VARIABLE_AUTHENTICATION_3_NONCE_TYPE: the variable's current nonce, of 1 byte or more
+    Nonce(Vec<u8>),
+}
+
+/// The metadata that starts `data`, checked strictly: Version 1, Flags 0, a
 /// TimeStamp in GMT or a NonceSize other than 0, CERT_ID_SHA256 with IdSize 32, and a
 /// MetadataSize where these descriptors end, as GetVariable() returns no
 /// WIN_CERTIFICATE_UEFI_GUID (UEFI 2.11 §8.2.1).
-fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal> {
+pub(crate) fn authentication_3_metadata(data: &[u8]) -> Result<Metadata, MetadataRefusal> {
     match byte(data, 0)? {
         AUTHENTICATION_3_VERSION => {}
         version => return Err(MetadataRefusal::Version(version)),
@@ -162,10 +220,10 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
     let type_ = byte(data, 1)?;
     let declared = le_u32(data, METADATA_SIZE_OFFSET)?;
     match le_u32(data, FLAGS_OFFSET)? {
-        0 => {}
+        GET_VARIABLE_FLAGS => {}
         flags => return Err(MetadataRefusal::Flags(flags)),
     }
-    let cert_id = match type_ {
+    let (cert_id, freshness) = match type_ {
         AUTHENTICATION_3_TIMESTAMP_TYPE => {
             let time_stamp = data
                 .get(AUTHENTICATION_3_SIZE..)
@@ -174,7 +232,10 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
             if !is_gmt_time_stamp(time_stamp) {
                 return Err(MetadataRefusal::TimeStamp);
             }
-            AUTHENTICATION_3_SIZE + EFI_TIME_SIZE
+            (
+                AUTHENTICATION_3_SIZE + EFI_TIME_SIZE,
+                StoredFreshness::TimeStamp(*time_stamp),
+            )
         }
         AUTHENTICATION_3_NONCE_TYPE => {
             let nonce_size = match le_u32(data, AUTHENTICATION_3_SIZE)? {
@@ -194,7 +255,10 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
             if padding.iter().any(|&byte| byte != 0) {
                 return Err(MetadataRefusal::NoncePadding);
             }
-            cert_id
+            let nonce = data
+                .get(AUTHENTICATION_3_SIZE + NONCE_HEADER_SIZE..nonce_end)
+                .ok_or(MetadataRefusal::truncated(data))?;
+            (cert_id, StoredFreshness::Nonce(nonce.to_vec()))
         }
         type_ => return Err(MetadataRefusal::Type(type_)),
     };
@@ -215,10 +279,91 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
     if usize::try_from(declared) != Ok(computed) {
         return Err(MetadataRefusal::MetadataSize { declared, computed });
     }
-    if data.len() < computed {
-        return Err(MetadataRefusal::truncated(data));
+    let id = data
+        .get(cert_id + CERT_ID_HEADER_SIZE..)
+        .and_then(<[u8]>::first_chunk::<SHA256_DIGEST_SIZE>)
+        .ok_or(MetadataRefusal::truncated(data))?;
+    Ok(Metadata {
+        size: computed,
+        freshness,
+        cert_id: *id,
+    })
+}
+
+/// The EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable with
+/// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS as `variable info` shows it (UEFI 2.11 §8.2.1): its
+/// headers, decoded, or why uefisettings does not take them, never their bytes.
+#[cfg(variable_info)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MetadataInfo(Result<Metadata, MetadataRefusal>);
+
+#[cfg(variable_info)]
+impl MetadataInfo {
+    /// The metadata that starts `data`, the GetVariable() data of a variable with `attributes`,
+    /// if it has metadata or claims to (has_metadata).
+    pub(crate) fn of(attributes: u32, data: &[u8]) -> Option<Self> {
+        match has_metadata(attributes) {
+            Ok(true) => Some(Self(authentication_3_metadata(data))),
+            Ok(false) => None,
+            Err(refusal) => Some(Self(Err(refusal))),
+        }
     }
-    Ok(computed)
+}
+
+/// As {"version", "type", "metadata_size", "flags", then "time_stamp", YYYY-MM-DDTHH:MM:SSZ, or
+/// "nonce", {"hex"}, as its Type says, then "cert_id": {"type", "id": {"hex"}}}, the fields of
+/// UEFI 2.11 §8.2.1, or as {"refused": why}.
+#[cfg(variable_info)]
+impl Serialize for MetadataInfo {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let metadata = match &self.0 {
+            Ok(metadata) => metadata,
+            Err(refusal) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("refused", &refusal.to_string())?;
+                return map.end();
+            }
+        };
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("version", &AUTHENTICATION_3_VERSION)?;
+        map.serialize_entry("type", &metadata.freshness.type_code())?;
+        map.serialize_entry("metadata_size", &metadata.size)?;
+        map.serialize_entry("flags", &GET_VARIABLE_FLAGS)?;
+        match &metadata.freshness {
+            StoredFreshness::TimeStamp(time) => {
+                map.serialize_entry("time_stamp", &GmtTime(time).to_string())?
+            }
+            StoredFreshness::Nonce(nonce) => map.serialize_entry("nonce", &Hex(nonce))?,
+        }
+        map.serialize_entry(
+            "cert_id",
+            &CertIdInfo {
+                type_: CERT_ID_SHA256,
+                id: Hex(&metadata.cert_id),
+            },
+        )?;
+        map.end()
+    }
+}
+
+/// An EFI_VARIABLE_AUTHENTICATION_3_CERT_ID as MetadataInfo shows it: its Type and Id.
+#[cfg(variable_info)]
+#[derive(Serialize)]
+struct CertIdInfo<'a> {
+    #[serde(rename = "type")]
+    type_: u8,
+    id: Hex<'a>,
+}
+
+#[cfg(variable_info)]
+impl StoredFreshness {
+    /// The Type of the metadata: EFI_VARIABLE_AUTHENTICATION_3_TIMESTAMP_TYPE or _NONCE_TYPE.
+    fn type_code(&self) -> u8 {
+        match self {
+            Self::TimeStamp(_) => AUTHENTICATION_3_TIMESTAMP_TYPE,
+            Self::Nonce(_) => AUTHENTICATION_3_NONCE_TYPE,
+        }
+    }
 }
 
 /// The little-endian UINT32 at `at` of `data`.
@@ -621,7 +766,7 @@ pub(crate) mod fixture {
     /// EFI_VARIABLE_AUTHENTICATION_3 of MetadataSize `metadata_size` ‖
     /// EFI_VARIABLE_AUTHENTICATION_3_NONCE with `nonce` ‖ `padding` ‖
     /// EFI_VARIABLE_AUTHENTICATION_3_CERT_ID.
-    #[cfg(efivar_dumps)]
+    #[cfg(any(efivar_dumps, variable_data))]
     pub(crate) fn nonce_metadata_of(nonce: &[u8], padding: &[u8], metadata_size: u32) -> Vec<u8> {
         let nonce_size = u32::try_from(nonce.len()).expect("test nonce fits NonceSize");
         [
@@ -637,7 +782,7 @@ pub(crate) mod fixture {
     }
 
     /// nonce_metadata_of 8 Nonce bytes, which need no padding: 64 bytes.
-    #[cfg(efivar_dumps)]
+    #[cfg(any(efivar_dumps, variable_data))]
     pub(crate) fn nonce_metadata() -> Vec<u8> {
         nonce_metadata_of(&[0xA5; 8], &[], 64)
     }
@@ -670,6 +815,43 @@ mod tests {
     /// EFI variable Attributes: non-volatile, boot service and runtime access, and enhanced
     /// authenticated access.
     const NV_BS_RT_ENHANCED: u32 = 0x87;
+
+    /// authentication_3_metadata gives the Secondary Descriptor: the EFI_TIME, or the Nonce
+    /// without its NonceSize and padding, and the Id of the CERT_ID.
+    #[test]
+    #[cfg(any(efivar_dumps, variable_data))]
+    fn authentication_3_metadata_gives_the_secondary_descriptor() {
+        use super::fixture::nonce_metadata_of;
+
+        let cases = [
+            (
+                "timestamp",
+                timestamp_metadata(),
+                68,
+                StoredFreshness::TimeStamp([
+                    0xEA, 0x07, 11, 6, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]),
+            ),
+            (
+                "a nonce of 3 bytes and 1 padding byte",
+                nonce_metadata_of(&[7; 3], &[0], 60),
+                60,
+                StoredFreshness::Nonce(vec![7; 3]),
+            ),
+        ];
+        let cert_id = std::array::from_fn(|at| u8::try_from(at).expect("an Id byte"));
+        for (case, data, size, freshness) in cases {
+            assert_eq!(
+                authentication_3_metadata(&data),
+                Ok(Metadata {
+                    size,
+                    freshness,
+                    cert_id
+                }),
+                "{case}"
+            );
+        }
+    }
 
     /// metadata_end takes metadata that ends the data, and refuses data that ends inside it.
     #[test]

@@ -27,10 +27,18 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
+#[cfg(variable_data)]
+use zeroize::Zeroizing;
 
 use crate::efi_variables::enhanced_authenticated::has_metadata;
 use crate::efi_variables::enhanced_authenticated::metadata_end;
 use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
+#[cfg(variable_data)]
+use crate::efi_variables::VariableContents;
+#[cfg(variable_data)]
+use crate::efi_variables::VariableData;
+#[cfg(variable_names)]
+use crate::efi_variables::VariableNames;
 use crate::hii::config_snapshot::SnapshotLookup;
 #[cfg(all(efivar_dumps, not(system_variables)))]
 use crate::hii::efivarfs_format::EfivarCopy;
@@ -731,7 +739,7 @@ fn read_value_bytes(
 /// A variable that FirmwareVariables does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("no EFI variable {0}")]
-pub(super) struct VariableNotFound(pub(super) VariableKey);
+pub(crate) struct VariableNotFound(pub(crate) VariableKey);
 
 /// A variable of VariableLayout::OneValue whose value is not as wide as its question's, which get
 /// and set refuse. UEFI 2.11 §33.2.5.4.10 requires that size of a cross-reference question's
@@ -1062,6 +1070,12 @@ impl VariableGuids {
     fn contains(&self, guid: &Guid) -> bool {
         self.every || self.guids.contains(guid)
     }
+
+    /// Whether it holds no GUID.
+    #[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+    fn is_empty(&self) -> bool {
+        !self.every && self.guids.is_empty()
+    }
 }
 
 /// The bytes of variables in which PASSWORD questions keep their passwords (UEFI 2.11
@@ -1075,6 +1089,16 @@ pub(crate) struct WithheldBytes {
     files: BTreeMap<EfivarFileName, FileBytes>,
     shared: Vec<Vec<Range<usize>>>,
     guids: VariableGuids,
+    /// The variables that `files` were recorded for, which a witness reads whether
+    /// GetNextVariableName() lists them or not
+    #[cfg_attr(
+        not(all(variable_data, variable_names, any(target_os = "uefi", test))),
+        allow(
+            dead_code,
+            reason = "only the UEFI Shell build runs driver code, which a witness compares across"
+        )
+    )]
+    keys: BTreeSet<VariableKey>,
 }
 
 /// The bytes that an efivar file withholds: its own, and the sets of WithheldBytes::shared at
@@ -1094,6 +1118,7 @@ impl WithheldBytes {
                 .or_default()
                 .own
                 .push(bytes);
+            self.keys.insert(key);
         }
     }
 
@@ -1123,6 +1148,7 @@ impl WithheldBytes {
             .or_default()
             .shared
             .push(sets);
+        self.keys.insert(key.clone());
     }
 
     /// The withheld bytes of `key`.
@@ -1207,6 +1233,37 @@ impl WithheldBytes {
         patches
             .into_iter()
             .try_for_each(|patch| self.check_write(key, &patch.range()))
+    }
+
+    /// Refuses a write that replaces every byte of `key`, as SetVariable() and deletion do, if it
+    /// has withheld bytes.
+    #[cfg(variable_data)]
+    fn check_replace(&self, key: &VariableKey) -> std::result::Result<(), WithheldPassword> {
+        self.check_write(key, &(0..usize::MAX))
+    }
+
+    /// Whether any variable may have withheld bytes.
+    #[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+    fn withholds_any(&self) -> bool {
+        !self.files.is_empty() || !self.guids.is_empty()
+    }
+
+    /// The withheld bytes of `key` in `value`, the start of its value, in the order of `of`.
+    #[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+    fn copy(&self, key: &VariableKey, value: &[u8]) -> Zeroizing<Vec<u8>> {
+        let len = value.len();
+        let parts: Vec<&[u8]> = self
+            .of(key)
+            .filter_map(|withheld| value.get(withheld.start.min(len)..withheld.end.min(len)))
+            .collect();
+        // sized first, as a reallocation would leave the bytes it moved unzeroed
+        let mut copy = Zeroizing::new(Vec::with_capacity(
+            parts.iter().map(|part| part.len()).sum(),
+        ));
+        for part in parts {
+            copy.extend_from_slice(part);
+        }
+        copy
     }
 
     /// Zeroes the withheld bytes of `key` in `value`, the start of its value.
@@ -1374,13 +1431,197 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
     }
 }
 
+/// As for FirmwareVariables: the Callback() sequences of the UEFI Shell build read and restore
+/// a FormSet's EFI variable stores, and list changed variables, through these. A read gives the
+/// withheld bytes as zero, where the value holds them; SetVariable() and deletion replace every
+/// byte of the variable, so they fail with WithheldPassword for a variable with withheld bytes
+/// before `variables` see it.
+#[cfg(variable_data)]
+impl<V: VariableData> VariableData for WithholdingVariables<V> {
+    fn interface(&self) -> VariableInterface {
+        VariableData::interface(&self.variables)
+    }
+
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        if !self.withheld.withholds(key) {
+            return self.variables.variable_data(key);
+        }
+        self.read_withheld(key)?
+            .map(|read| read.zeroed(&self.withheld, key))
+            .transpose()
+    }
+
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        self.withheld.check_replace(key)?;
+        self.variables.set_variable(key, contents)
+    }
+
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        self.withheld.check_replace(key)?;
+        self.variables.delete_variable(key)
+    }
+}
+
+/// One read of a variable that has withheld bytes: its attributes, and its data in a buffer that
+/// zeroes on drop, the value from `value` on (value_of), so that no byte of it outlives the read
+/// in memory that is freed.
+#[cfg(variable_data)]
+struct WithheldRead {
+    attributes: VariableAttributes,
+    data: Zeroizing<Vec<u8>>,
+    value: usize,
+}
+
+#[cfg(variable_data)]
+impl WithheldRead {
+    /// Its data with the bytes that `withheld` withholds of `key` zeroed, in place.
+    fn zeroed(mut self, withheld: &WithheldBytes, key: &VariableKey) -> Result<VariableContents> {
+        if let Some(value) = self.data.get_mut(self.value..) {
+            withheld.zero(key, value);
+        }
+        Ok(VariableContents::new(
+            self.attributes,
+            std::mem::take(&mut *self.data),
+        )?)
+    }
+
+    /// The witness of the bytes that `withheld` withholds of `key`.
+    #[cfg(all(variable_names, any(target_os = "uefi", test)))]
+    fn witness(&self, withheld: &WithheldBytes, key: &VariableKey) -> WithheldWitness {
+        let value = self.data.get(self.value..).unwrap_or_default();
+        WithheldWitness(withheld.copy(key, value))
+    }
+}
+
+/// What one GetVariable() into a buffer gave.
+// the UEFI Shell build reads with GetVariable(); the tests run on every host
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) enum GetVariableCall<A> {
+    /// It wrote `size` bytes of data, and the attributes
+    Read { size: usize, attributes: A },
+    /// EFI_BUFFER_TOO_SMALL: the data needs this many bytes
+    TooSmall(usize),
+}
+
+/// The data and the attributes of variable `key` that `get_variable` reads, GetVariable() into a
+/// buffer that zeroes on drop: empty first, then a new one of each size that a call asks for,
+/// never reallocated, as a reallocation frees the block that held the data unzeroed.
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) fn read_zeroing<A>(
+    key: &VariableKey,
+    mut get_variable: impl FnMut(&mut [u8]) -> Result<GetVariableCall<A>>,
+) -> Result<(Zeroizing<Vec<u8>>, A)> {
+    let mut data = Zeroizing::new(Vec::new());
+    loop {
+        match get_variable(data.as_mut_slice())? {
+            // an EFI variable holds one byte of data at least (UEFI 2.11 §8.2.3)
+            GetVariableCall::Read { size: 0, .. } => {
+                return Err(anyhow!(
+                    "GetVariable() of EFI variable {key} returned EFI_SUCCESS without data"
+                ))
+            }
+            GetVariableCall::Read { size, attributes } if size <= data.len() => {
+                data.truncate(size);
+                return Ok((data, attributes));
+            }
+            GetVariableCall::TooSmall(size) if size > data.len() => {
+                data = Zeroizing::new(vec![0; size]);
+            }
+            GetVariableCall::Read { size, .. } => {
+                return Err(anyhow!(
+                    "GetVariable() of EFI variable {key} wrote {size} bytes into a buffer of {}",
+                    data.len()
+                ))
+            }
+            GetVariableCall::TooSmall(size) => {
+                return Err(anyhow!(
+                    "GetVariable() of EFI variable {key} returned EFI_BUFFER_TOO_SMALL for a \
+                     buffer of {} bytes, asking for {size}",
+                    data.len()
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(variable_data)]
+impl<V: VariableData> WithholdingVariables<V> {
+    /// One read of `key`, which has withheld bytes; None if it is absent.
+    fn read_withheld(&self, key: &VariableKey) -> Result<Option<WithheldRead>> {
+        let Some(contents) = self.variables.variable_data(key)? else {
+            return Ok(None);
+        };
+        let attributes = contents.attributes();
+        let data = Zeroizing::new(contents.into_data());
+        let value = data.len() - value_of(key, attributes.bits(), &data)?.len();
+        Ok(Some(WithheldRead {
+            attributes,
+            data,
+            value,
+        }))
+    }
+}
+
+/// The withheld bytes of one variable, as one read gave them: equal witnesses tell that those
+/// bytes did not change, without showing them, as Debug shows none.
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WithheldWitness(Zeroizing<Vec<u8>>);
+
+/// The driver code that the UEFI Shell build runs tells through these whether it changed a
+/// password, which uefisettings never reads or writes (variable_changes).
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+impl<V: VariableData> WithholdingVariables<V> {
+    /// Whether any variable may have withheld bytes.
+    pub(crate) fn withholds_any(&self) -> bool {
+        self.withheld.withholds_any()
+    }
+
+    /// Whether `key` has withheld bytes.
+    pub(crate) fn withholds(&self, key: &VariableKey) -> bool {
+        self.withheld.withholds(key)
+    }
+
+    /// The variables that the withheld bytes were recorded for, listed or not.
+    pub(crate) fn named(&self) -> impl Iterator<Item = &VariableKey> {
+        self.withheld.keys.iter()
+    }
+
+    /// One read of `key`: its data as variable_data gives it, and the witness of its withheld
+    /// bytes, None if it has none; None if it is absent.
+    pub(crate) fn witnessed_data(
+        &self,
+        key: &VariableKey,
+    ) -> Result<Option<(VariableContents, Option<WithheldWitness>)>> {
+        if !self.withheld.withholds(key) {
+            return Ok(self
+                .variables
+                .variable_data(key)?
+                .map(|contents| (contents, None)));
+        }
+        let Some(read) = self.read_withheld(key)? else {
+            return Ok(None);
+        };
+        let witness = read.witness(&self.withheld, key);
+        Ok(Some((read.zeroed(&self.withheld, key)?, Some(witness))))
+    }
+}
+
+/// The names of every variable, also of the withheld ones, whose names hold no password.
+#[cfg(variable_names)]
+impl<V: VariableNames> VariableNames for WithholdingVariables<V> {
+    fn variable_names(&self) -> Result<Vec<VariableKey>> {
+        self.variables.variable_names()
+    }
+}
+
 /// A write that WithholdingVariables refuse: it overlaps the bytes of a password.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error(
     "EFI variable {key} holds a password {}, which set never writes",
     PasswordBytes(.bytes)
 )]
-pub(super) struct WithheldPassword {
+pub(crate) struct WithheldPassword {
     key: VariableKey,
     bytes: Range<usize>,
 }
@@ -1397,6 +1638,14 @@ impl std::fmt::Display for PasswordBytes<'_> {
         }
     }
 }
+
+/// get's or set's refusal of a question where driver code changed password bytes, or they could
+/// not be compared across it; apply-staged applies no later request (apply_requests).
+// the Callback()s run in the UEFI Shell build; apply-staged's tests run on every host
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub(crate) struct PasswordBytesRefusal(pub(crate) String);
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1615,6 +1864,48 @@ pub(crate) mod tests {
         ) -> Result<()> {
             self.as_ref()
                 .write_patches(key, size, patches, volatile, missing)
+        }
+    }
+
+    /// GetVariable() and SetVariable() of the shared MemoryVariables, as driver code reaches
+    /// them, recording neither reads nor writes.
+    #[cfg(variable_data)]
+    impl VariableData for Rc<MemoryVariables> {
+        fn interface(&self) -> VariableInterface {
+            self.interface
+        }
+
+        fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+            let variables = self.variables.borrow();
+            let Some(bytes) = variables.get(key) else {
+                return Ok(None);
+            };
+            let attributes = efivar_attributes(bytes).context("attributes word")?;
+            let data = bytes.get(EFIVARFS_HEADER_SIZE..).unwrap_or_default();
+            Ok(Some(VariableContents::new(
+                VariableAttributes::from_bits_retain(attributes),
+                data.to_vec(),
+            )?))
+        }
+
+        fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+            self.insert(key.clone(), contents.attributes().bits(), contents.data());
+            Ok(())
+        }
+
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            match self.variables.borrow_mut().remove(key) {
+                Some(_) => Ok(()),
+                None => Err(VariableNotFound(key.clone()).into()),
+            }
+        }
+    }
+
+    /// GetNextVariableName() of the shared MemoryVariables.
+    #[cfg(variable_names)]
+    impl VariableNames for Rc<MemoryVariables> {
+        fn variable_names(&self) -> Result<Vec<VariableKey>> {
+            Ok(self.variables.borrow().keys().cloned().collect())
         }
     }
 
@@ -2118,6 +2409,86 @@ pub(crate) mod tests {
                 "{interface:?}: the password's bytes"
             );
         }
+    }
+
+    /// As FirmwareVariables, WithholdingVariables' VariableData read the withheld bytes of a
+    /// variable as zero, and refuse to set or delete a variable with withheld bytes, which
+    /// SetVariable() and deletion replace whole, before their variables see it; they pass the
+    /// other variables through, and list every name.
+    #[cfg(all(variable_data, variable_names))]
+    #[test]
+    fn withheld_variable_data_reads_as_zero_and_is_neither_set_nor_deleted() {
+        use crate::efi_variables::globals::tests::key;
+        use crate::efi_variables::globals::tests::HeldVariables;
+
+        let variables = HeldVariables::default()
+            .with("Setup", NIL_GUID, &[1])
+            .with("AMITSESetup", NIL_GUID, &[1, 0xAA, 0xAA, 2])
+            .with("Other", NIL_GUID, &[3]);
+        let password = key("AMITSESetup", NIL_GUID);
+        let setup = key("Setup", NIL_GUID);
+        let other = key("Other", NIL_GUID);
+        let mut withheld = WithheldBytes::default();
+        withheld.insert(password.clone(), 1..3);
+        let withholding = WithholdingVariables::new(variables, withheld);
+        let contents =
+            VariableContents::new(VariableAttributes::NON_VOLATILE, vec![0]).expect("contents");
+        let refusal = format!(
+            "EFI variable {password} holds a password at bytes 1..3, which set never writes"
+        );
+
+        assert_eq!(
+            withholding
+                .variable_data(&password)
+                .expect("read AMITSESetup")
+                .map(|read| read.data().to_vec()),
+            Some(vec![1, 0, 0, 2]),
+            "read AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .set_variable(&password, &contents)
+                .map_err(|error| error.to_string()),
+            Err(refusal.clone()),
+            "set AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .delete_variable(&password)
+                .map_err(|error| error.to_string()),
+            Err(refusal),
+            "delete AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .variable_data(&setup)
+                .expect("read Setup")
+                .map(|read| read.data().to_vec()),
+            Some(vec![1]),
+            "read Setup"
+        );
+        withholding
+            .set_variable(&setup, &contents)
+            .expect("set Setup");
+        withholding.delete_variable(&other).expect("delete Other");
+        assert_eq!(
+            *withholding.variables.set.borrow(),
+            std::slice::from_ref(&setup),
+            "set: Setup only"
+        );
+        assert_eq!(
+            *withholding.variables.deleted.borrow(),
+            [other],
+            "deleted: Other only"
+        );
+        assert_eq!(
+            withholding.variables.variables.borrow()[&password].data(),
+            [1, 0xAA, 0xAA, 2],
+            "AMITSESetup keeps its password"
+        );
+        let mut names = withholding.variable_names().expect("names");
+        names.sort();
+        assert_eq!(names, [password, setup], "every name listed");
     }
 
     /// WithholdingVariables zero the withheld bytes of a variable with
@@ -2783,5 +3154,270 @@ pub(crate) mod tests {
             "refusal"
         );
         assert_eq!(bytes, before, "bytes");
+    }
+
+    /// read_zeroing refuses a GetVariable() that wrote no data, or more than its buffer holds, or
+    /// that asks for a buffer no larger than the one it had, which would never end.
+    #[test]
+    #[cfg(variable_data)]
+    fn a_zeroing_read_refuses_a_size_that_contradicts_its_buffer() {
+        let key = VariableKey {
+            name: "Store".to_owned(),
+            guid: NIL_GUID,
+        };
+        let cases = [
+            (
+                "no data",
+                [
+                    GetVariableCall::Read {
+                        size: 0,
+                        attributes: (),
+                    },
+                    GetVariableCall::TooSmall(1),
+                ],
+                format!("GetVariable() of EFI variable {key} returned EFI_SUCCESS without data"),
+            ),
+            (
+                "more data than its buffer",
+                [
+                    GetVariableCall::TooSmall(2),
+                    GetVariableCall::Read {
+                        size: 3,
+                        attributes: (),
+                    },
+                ],
+                format!("GetVariable() of EFI variable {key} wrote 3 bytes into a buffer of 2"),
+            ),
+            (
+                "too small for its own size",
+                [GetVariableCall::TooSmall(2), GetVariableCall::TooSmall(2)],
+                format!(
+                    "GetVariable() of EFI variable {key} returned EFI_BUFFER_TOO_SMALL for a \
+                     buffer of 2 bytes, asking for 2"
+                ),
+            ),
+        ];
+        for (case, calls, want) in cases {
+            let mut calls = calls.into_iter();
+
+            let read = read_zeroing(&key, |_| Ok(calls.next().expect("a call")));
+
+            assert_eq!(
+                read.map(drop).map_err(|error| error.to_string()),
+                Err(want),
+                "{case}"
+            );
+        }
+    }
+
+    /// Whether a read of withheld bytes leaves any of them in memory that it frees: the allocator
+    /// of the library's tests counts the freed blocks that hold a marker.
+    #[cfg(variable_data)]
+    mod freed_bytes {
+        use std::alloc::GlobalAlloc;
+        use std::alloc::Layout;
+        use std::alloc::System;
+        use std::cell::Cell;
+        use std::thread::AccessError;
+
+        use super::*;
+        use crate::efi_variables::globals::tests::key;
+        use crate::efi_variables::globals::tests::HeldVariables;
+
+        /// Stands in for a password in the tests below; no other block of theirs holds it.
+        const MARKER: &[u8] = &[0xC3, 0x5E, 0x9A, 0x17, 0xE4, 0x2B, 0x71, 0xD8];
+
+        /// The system's allocator, zeroing each block that it hands out, so that a byte buffer
+        /// holds no uninitialized byte when it is freed, and counting the freed byte buffers that
+        /// hold the marker of their thread while it counts (freed_holding).
+        struct MarkerCounting;
+
+        thread_local! {
+            /// The marker whose freed blocks this thread counts, with their count
+            static COUNTING: Cell<Option<(&'static [u8], usize)>> = const { Cell::new(None) };
+        }
+
+        // SAFETY: alloc hands its layout on to System, as GlobalAlloc::alloc requires; dealloc
+        // reads a block only while its thread counts, before System frees it with the layout
+        // that it was allocated with.
+        unsafe impl GlobalAlloc for MarkerCounting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: the caller passes a layout of non-zero size, as alloc requires
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                let counted = COUNTING.try_with(|counting| {
+                    let (Some((marker, count)), 1) = (counting.get(), layout.align()) else {
+                        return;
+                    };
+                    // SAFETY: `ptr` is a block of `layout`, still allocated, of alignment 1: a
+                    // byte buffer of the read under count, which alloc handed out zeroed and
+                    // which holds only bytes written as u8 since, so each of its
+                    // `layout.size()` bytes is initialized
+                    let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                    if block.windows(marker.len()).any(|window| window == marker) {
+                        counting.set(Some((marker, count + 1)));
+                    }
+                });
+                match counted {
+                    // a thread that ends counts nothing any more
+                    Ok(()) | Err(AccessError { .. }) => {}
+                }
+                // SAFETY: System allocated `ptr` with `layout`, as the caller guarantees of a
+                // block of alloc
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: MarkerCounting = MarkerCounting;
+
+        /// How many blocks this thread freed holding `marker` while `run` ran.
+        fn freed_holding(marker: &'static [u8], run: impl FnOnce()) -> usize {
+            assert!(
+                !marker.is_empty(),
+                "an empty marker, which dealloc would panic on"
+            );
+            COUNTING.with(|counting| counting.set(Some((marker, 0))));
+            run();
+            let (_, freed) = COUNTING.with(Cell::take).expect("counting");
+            freed
+        }
+
+        /// `variables` holding the marker in the value of Store, withheld, and a byte on each
+        /// side of it.
+        fn withholding_marker(variables: &HeldVariables) -> WithholdingVariables<&HeldVariables> {
+            let data = [&[1][..], MARKER, &[2]].concat();
+            variables
+                .variables
+                .borrow_mut()
+                .insert(key("Store", NIL_GUID), contents(&data));
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(key("Store", NIL_GUID), 1..1 + MARKER.len());
+            WithholdingVariables::new(variables, withheld)
+        }
+
+        fn contents(data: &[u8]) -> VariableContents {
+            VariableContents::new(
+                VariableAttributes::from_bits_retain(NV_BS_RT),
+                data.to_vec(),
+            )
+            .expect("contents")
+        }
+
+        #[test]
+        fn the_allocator_counts_a_freed_marker() {
+            assert_eq!(
+                freed_holding(MARKER, || drop(std::hint::black_box(MARKER.to_vec()))),
+                1,
+                "a freed copy"
+            );
+            assert_eq!(
+                freed_holding(MARKER, || drop(vec![0; MARKER.len()])),
+                0,
+                "a freed block without it"
+            );
+        }
+
+        /// read_zeroing of a variable that keeps its size between its GetVariable() calls, shrinks
+        /// or grows: the data that the last call wrote, and no freed block held it.
+        #[test]
+        fn a_zeroing_read_frees_no_byte_of_a_variable_that_changes_size() {
+            let len = MARKER.len();
+            for (case, sizes) in [
+                ("the same size", &[len, len][..]),
+                ("shrinks", &[len + 4, len][..]),
+                ("grows", &[len - 2, len, len][..]),
+            ] {
+                let mut calls = sizes.iter();
+
+                let freed = freed_holding(MARKER, || {
+                    let (data, attributes) = read_zeroing(&key("Store", NIL_GUID), |buffer| {
+                        let size = *calls.next().expect("a call for each size");
+                        match buffer.get_mut(..size) {
+                            Some(data) => {
+                                data.copy_from_slice(MARKER);
+                                Ok(GetVariableCall::Read {
+                                    size,
+                                    attributes: NV_BS_RT,
+                                })
+                            }
+                            None => Ok(GetVariableCall::TooSmall(size)),
+                        }
+                    })
+                    .expect("read");
+                    assert_eq!(&data[..], MARKER, "{case}: the data");
+                    assert_eq!(attributes, NV_BS_RT, "{case}: the attributes");
+                });
+
+                assert_eq!(calls.next(), None, "{case}: a call for each size");
+                assert_eq!(freed, 0, "{case}: freed blocks that held the data");
+            }
+        }
+
+        #[test]
+        fn a_withheld_read_frees_no_withheld_byte() {
+            let variables = HeldVariables::default();
+            let withholding = withholding_marker(&variables);
+
+            let freed = freed_holding(MARKER, || {
+                let read = withholding
+                    .variable_data(&key("Store", NIL_GUID))
+                    .expect("read");
+                assert!(read.is_some(), "the variable read");
+            });
+
+            assert_eq!(freed, 0, "freed blocks that held the withheld bytes");
+        }
+
+        #[test]
+        #[cfg(variable_names)]
+        fn a_witness_of_two_ranges_frees_no_withheld_byte() {
+            let variables = HeldVariables::default();
+            let data = [&[1][..], MARKER, &[2], MARKER, &[3]].concat();
+            variables
+                .variables
+                .borrow_mut()
+                .insert(key("Store", NIL_GUID), contents(&data));
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(key("Store", NIL_GUID), 1..1 + MARKER.len());
+            withheld.insert(
+                key("Store", NIL_GUID),
+                2 + MARKER.len()..2 + 2 * MARKER.len(),
+            );
+            let withholding = WithholdingVariables::new(&variables, withheld);
+
+            let freed = freed_holding(MARKER, || {
+                let read = withholding
+                    .witnessed_data(&key("Store", NIL_GUID))
+                    .expect("read");
+                assert!(
+                    matches!(read, Some((_, Some(_)))),
+                    "the variable read, with a witness"
+                );
+            });
+
+            assert_eq!(freed, 0, "freed blocks that held the withheld bytes");
+        }
+
+        #[test]
+        #[cfg(variable_names)]
+        fn a_witnessed_read_frees_no_withheld_byte() {
+            let variables = HeldVariables::default();
+            let withholding = withholding_marker(&variables);
+
+            let freed = freed_holding(MARKER, || {
+                let read = withholding
+                    .witnessed_data(&key("Store", NIL_GUID))
+                    .expect("read");
+                assert!(
+                    matches!(read, Some((_, Some(_)))),
+                    "the variable read, with a witness"
+                );
+            });
+
+            assert_eq!(freed, 0, "freed blocks that held the withheld bytes");
+        }
     }
 }

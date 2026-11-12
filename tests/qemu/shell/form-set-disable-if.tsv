@@ -1,0 +1,57 @@
+# The checks of shell/form-set-disable-if.nsh. See check-shell-log.sh.
+# Hidden and the PASSWORD, in a form under a true DISABLE_IF outside forms, are no questions, with
+# every --include, and Shown, in a SUPPRESS_IF on Hidden, is not suppressed; O shows no byte of the
+# password; After and Later may be disabled, as the checks of the reasons, which stop before their
+# section sign, which the aarch64 console prints as ?, tell
+list-questions	status	0x0
+list-questions	json	(map(select(.form_set_guid == "8C78A505-BAA0-4C4A-869F-000000002400") | .name) == ["Gate", "Shown", "O", "After", "Later"]) and (map(select(.form_set_guid == "8C78A505-BAA0-4C4A-869F-000000002400" and .name == "Shown") | .answer) == ["2"])
+list-questions	none	bb bb|BB BB|bbbb|BBBB
+list-questions-all	status	0x0
+list-questions-all	json	(map(select(.form_set_guid == "8C78A505-BAA0-4C4A-869F-000000002400") | .name) == ["Gate", "Shown", "O", "After", "Later"]) and (map(select(.form_set_guid == "8C78A505-BAA0-4C4A-869F-000000002400" and .name == "Shown") | .answer) == ["2"])
+list-questions-all	none	bb bb|BB BB|bbbb|BBBB
+get-hidden	status	0x0
+get-hidden	json	.responses | length == 0
+get-hidden-all	status	0x0
+get-hidden-all	json	.responses | length == 0
+get-shown	status	0x0
+get-shown	json	.responses | length == 1 and .[0].question.answer == "2"
+get-after	status	0x0
+get-after	json	.responses | length == 1 and (.[0].question.answer | startswith("3 <selectable or disabled: it relies on EFI_IFR_EQ_ID_VAL, where a DISABLE_IF outside forms must only rely on constants (UEFI 2.11 "))
+get-later	status	0x0
+get-later	json	.responses | length == 1 and (.[0].question.answer | startswith("4 <selectable or disabled: it is after an EFI_IFR_SUPPRESS_IF in the scope of a DISABLE_IF of its FormSet, whose condition is TRUE: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes that condition for the DISABLE_IF's, which may skip the rest of its scope (:1690-1704, :3045-3059), where UEFI 2.11 "))
+get-o	status	0x0
+get-o	json	.responses | length == 1 and (.[0].question.answer | startswith("<ValueUnavailable: its bytes hold a password>"))
+get-o	none	bb bb|BB BB|bbbb|BBBB
+dmpstore-before	status	any
+dmpstore-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000002401:UefisettingsFormSetDisableIf' DataSize = 0x18$
+dmpstore-before	line	^  00000000: 00 01 02 03 04 00 00 00-BB BB BB BB BB BB BB BB  \*\.{16}\*$
+dmpstore-before	line	^  00000010: BB BB BB BB BB BB BB BB- +\*\.{8}\*$
+# The PASSWORD is a setup password question, which no setup browser asks for in the UEFI Shell
+set-flagless	status	aborted
+set-flagless	json	. == {"error_message": "this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; pass --i-am-fine-to-brick-this-system to write without it"}
+# and --i-am-fine-to-brick-this-system selects no Hidden, nor After or Later without disabled
+# questions included, and writes no byte of the password
+set-hidden	status	aborted
+set-hidden	json	.error_message | startswith("no question \"Hidden\" in the HiiDB")
+set-after-refused	status	aborted
+set-after-refused	json	.error_message | startswith("cannot tell whether question \"After\" is disabled: it relies on EFI_IFR_EQ_ID_VAL, where a DISABLE_IF outside forms must only rely on constants (UEFI 2.11 ") and endswith("; also include disabled questions to select it regardless")
+set-later-refused	status	aborted
+set-later-refused	json	.error_message | startswith("cannot tell whether question \"Later\" is disabled: it is after an EFI_IFR_SUPPRESS_IF in the scope of a DISABLE_IF of its FormSet, whose condition is TRUE: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes that condition for the DISABLE_IF's, which may skip the rest of its scope (:1690-1704, :3045-3059), where UEFI 2.11 ") and endswith("; also include disabled questions to select it regardless")
+set-o	status	aborted
+set-o	json	.error_message | endswith("holds a password at bytes 8..24, which set never writes")
+set-o	none	bb bb|BB BB|bbbb|BBBB
+dmpstore-refused	status	any
+dmpstore-refused	same	dmpstore-before
+# With disabled questions included, it writes the bytes of After and Later alone
+set-after	status	0x0
+set-after	warned	.responses | length == 1 and (.[0].question.answer | startswith("9 <selectable or disabled: it relies on EFI_IFR_EQ_ID_VAL, where a DISABLE_IF outside forms must only rely on constants (UEFI 2.11 ")) and .[0].modified == true
+set-after	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
+set-later	status	0x0
+set-later	warned	.responses | length == 1 and (.[0].question.answer | startswith("7 <selectable or disabled: it is after an EFI_IFR_SUPPRESS_IF in the scope of a DISABLE_IF of its FormSet, whose condition is TRUE: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes that condition for the DISABLE_IF's, which may skip the rest of its scope (:1690-1704, :3045-3059), where UEFI 2.11 ")) and .[0].modified == true
+set-later	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
+dmpstore-after	status	any
+dmpstore-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000002401:UefisettingsFormSetDisableIf' DataSize = 0x18$
+dmpstore-after	line	^  00000000: 00 01 02 09 07 00 00 00-BB BB BB BB BB BB BB BB  \*\.{16}\*$
+dmpstore-after	line	^  00000010: BB BB BB BB BB BB BB BB- +\*\.{8}\*$
+get-after-written	status	0x0
+get-after-written	json	.responses | length == 1 and (.[0].question.answer | startswith("9 <selectable or disabled: it relies on EFI_IFR_EQ_ID_VAL, where a DISABLE_IF outside forms must only rely on constants (UEFI 2.11 "))

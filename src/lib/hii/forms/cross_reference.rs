@@ -157,6 +157,8 @@ pub(super) fn handle_cross_reference(
             .display(reference.question_header.help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        // a REF without a VarStore is no listed question
+        driver_held: None,
         varstore,
         location: reference.location(),
         input: TextInput::CrossReference,
@@ -183,6 +185,7 @@ mod tests {
     use super::super::set::NewAnswer;
     use super::super::set_questions;
     use super::super::storageless::StoragelessQuestion;
+    use super::super::CheckedVarStores;
     use super::super::DefaultId;
     use super::hii_ref;
     use super::ref_text;
@@ -236,7 +239,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         .into_iter()
@@ -304,6 +307,7 @@ mod tests {
                 .iter()
                 .map(|&(id, text)| (id, text.into()))
                 .collect(),
+            replaced: Default::default(),
         };
         let packages = [
             package(b"x-UEFI-ns", &[(3, "Keyword"), (9, "OnlyKeyword")]),
@@ -515,10 +519,11 @@ mod tests {
                 answer,
                 IncludedStates::empty(),
                 &mut reader,
-                None,
+                CheckedVarStores::NONE,
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, WithheldBytes::default()),
+                &[],
             )
             .map(drop)
             .map_err(|error| format!("{error:#}"));

@@ -113,8 +113,16 @@ write no variable of a HiiDB with one, nor do `hii list-questions` and `hii show
 its Config Keyword Handler takes, counts as one outside any FormSet, also for the password questions
 of FormSets of its VarStoreId. IFR after an op that does not fit its form
 package has no op boundary, so they read and write no variable of such a HiiDB, nor do
-`hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
-uefisettings cannot find withholds no bytes, which they warn of. A password question that edk2 may
+`hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question of a VarStoreId
+that no VarStore of its form package that decodes declares names no VarStore (UEFI 2.11
+§33.3.8.2.2 asks for "a previously declared variable store"), and edk2's Forms Browser finds none
+for it but a VarStore op of its FormSet, outside an unknown opcode's scope, that does not decode,
+whose fields it reads past the op's end, so they read and write no variable of a HiiDB with one,
+nor do `hii list-questions` and
+`hii show-ifr` but with `--no-efivars`; one whose FormSet declares no VarStore of its VarStoreId,
+which another VarStore of its form package declares, keeps its password at its offset in the first
+of those, which edk2's Config Keyword Handler takes, where `get` withholds it, and they warn of it.
+A password question that edk2 may
 route to a VARSTORE_NAME_VALUE, whose values its driver exposes, as UEFI 2.11 §33.2.5.6 says,
 through EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage of its own choosing, may keep its password in any
 variable, so they read and write no variable of a HiiDB with one, as for IFR without an op boundary,
@@ -132,18 +140,30 @@ writes no variable of a HiiDB with such a password question or with IFR that it 
 
 ```plain
 Commands:
-  get           Show the attributes and the decoded value of a global variable of UEFI 2.11 section
-                3.3, but its load options, hot keys and device paths, or of a signature database, or
-                that it is absent
-  help          Print this message or the help of the given subcommand(s)
-  info          Show the attributes and the size of an EFI variable, never its data
-  list          List the name and vendor GUID of every EFI variable, never its data
-  set           Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
-                BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications
-  storage       Show the storage space of the EFI variables of some attributes, and how much of it
-                is left
-  write-signed  Write an EFI variable from a signed payload, or from new data that a key signs; the
-                firmware verifies the signature
+  create-key          Create a Key#### that does not exist: a hot key that starts a Boot####
+  create-load-option  Create a Boot####, Driver#### or SysPrep#### that does not exist, from device
+                      paths as text or files of their bytes
+  get                 Show the attributes and the decoded value of a global variable of UEFI 2.11
+                      section 3.3, its load options, hot keys and device paths as text among them,
+                      or of a signature database, or that it is absent
+  help                Print this message or the help of the given subcommand(s)
+  info                Show the attributes and the size of an EFI variable, and the
+                      EFI_VARIABLE_AUTHENTICATION_3 metadata of one with
+                      enhanced-authenticated-access, never its data
+  list                List the name and vendor GUID of every EFI variable, never its data
+  set                 Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
+                      BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications;
+                      or, in the UEFI Shell, AuditMode and DeployedMode with
+                      --i-am-fine-to-brick-this-system
+  set-attributes      Set and clear the flags and set the category of a Boot####, Driver#### or
+                      SysPrep####, keeping its other bits and bytes, and the Key#### of a Boot####
+                      following it
+  set-device-path     Set ConIn, ConOut or ErrOut to a device path, as text or a file of its bytes,
+                      keeping its attributes
+  storage             Show the storage space of the EFI variables of some attributes, and how much
+                      of it is left
+  write-signed        Write an EFI variable from a signed payload, or from new data that a key
+                      signs; the firmware verifies the signature
 ```
 
 `capsule`:
@@ -180,8 +200,9 @@ Commands:
 and the `hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots;
 it also reaches boot-service-only variables and the Time Services, which date and time questions
 of EFI Date/Time Storage read and write, and has no `-f` or `--efivars`. It reads the HiiDB
-through the HII Database Protocol, and accepts `--hii-source` and `--efivar-memory` only to ignore
-them.
+through the HII Database Protocol, and refuses `--hii-source` and `--efivar-memory` as unexpected
+arguments. Its `apply-staged` applies a set that `set` staged from Linux or Windows for the next
+boot: see the [appendix](#appendix).
 
 ```sh
 rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
@@ -192,8 +213,8 @@ cargo build --release --target x86_64-unknown-uefi
 FS0:\> uefisettings.efi hii get --json "Activate this check box"
 ```
 
-Exit statuses, setup passwords, `variable`, capsules and Secure Boot: see the
-[appendix](#appendix).
+Exit statuses, setup passwords, `variable`, capsules, Secure Boot and sets staged for the next
+boot: see the [appendix](#appendix).
 
 ---
 
@@ -207,12 +228,13 @@ be assigned to the process token; running elevated alone does not guarantee it.
 Pass `--no-efivars` to read no variables. No driver is shipped with this repository,
 and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file. `--hii-source` and
-`--efivar-memory` are accepted and ignored.
+`--efivar-memory` are refused as unexpected arguments.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
 reach EFI variables only. `capsule config-data` and `capsule result-table` fail too:
 `uefisettings` reads the configuration tables of the EFI System Table only in the UEFI Shell, and on
-Linux on x86, x86_64 and aarch64.
+Linux on x86, x86_64 and aarch64. As on Linux, `set` stages a question whose value only its driver
+holds for the next boot, through the ESP's volume: see the [appendix](#appendix).
 
 ---
 
@@ -223,8 +245,8 @@ and writes nothing: `hii get`, `hii list-questions` and `hii show-ifr` read ques
 an efivars dump that `hii dump-efivars` wrote on Linux (`--efivars DIR`, with its HiiDB unless
 `-f` names one) or from none (`--no-efivars`, with `-f`), and `hii list-strings` reads the HiiDB
 file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `variable`, `capsule`, `hii set`,
-`hii extract-db` or `hii dump-efivars`; it accepts `--hii-source` and `--efivar-memory` and ignores
-them. Dumps: see the [appendix](#appendix).
+`hii extract-db` or `hii dump-efivars`; it refuses `--hii-source` and `--efivar-memory` as
+unexpected arguments. Dumps: see the [appendix](#appendix).
 
 ---
 
@@ -251,6 +273,7 @@ otherwise.
 | Operation | Commands | Build | Consequence |
 |---|---|---|---|
 | A write in a HiiDB that declares a setup password question | `set`, `hii set`, `hii keyword set` | UEFI Shell | No password is asked or checked, as the UEFI Shell runs no setup browser |
+| A set staged for the next boot in a HiiDB that declares a setup password question | `set`, `hii set`, which record the flag for `apply-staged` | Linux, Windows | The next boot applies it before the OS, where no setup browser asks for or checks the password |
 | A write of a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only | `set`, `hii set` | Linux, UEFI Shell, Windows | A value changes that the firmware declares read-only; the Keyword Handler refuses it as "a violation of system policy" (UEFI 2.11 §35.3.2) |
 | A signed write of a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware writes it without checking the signature (UEFI 2.11 §3.3, §32.3) |
 | A signed write of a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware may write it without checking the signature (UEFI 2.11 §32.6.3) |
@@ -261,6 +284,16 @@ otherwise.
 `capsule deliver` takes no flag: its payload goes to the firmware's JSON configuration processor,
 which UEFI 2.11 has check it against a schema and answer per capsule (§8.5.6.1.3), unlike
 SetVariable(), which stores bytes with "no read, write, or delete security protection" (§8.2.3).
+
+The boot manager's writes take no flag either: `variable set` of its variables and `variable
+set-attributes`, `create-load-option`, `set-device-path` and `create-key` write variables of UEFI
+2.11 Table 3.1 that the OS writes, and another write or a deletion undoes each (§8.2.3); each
+`warning:` line they print names what the boot manager may ignore, not a harm to the machine.
+
+`get` of a question whose value only its driver keeps takes no flag either: it restores any store
+that its RETRIEVE Callback() changed, which undoes only the driver's own change, and its
+ExtractConfig() reads of the FormSet's Buffer and Name/Value stores reach the driver without the
+flag too (see the UEFI Shell details).
 
 ---
 
@@ -286,12 +319,12 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
   * `systab`, on x86, x86_64 and aarch64: read the HII database export that the firmware lists as the EFI configuration table of `EFI_HII_DATABASE_PROTOCOL_GUID` (UEFI 2.11 §33.2.11.1), as EDK2 does where `PcdHiiOsRuntimeSupport` is TRUE, from `/dev/mem`, as `capsule config-data` reads its table: the package lists from the buffer's start up to a package list header of zeros, which EDK2 leaves after them, refusing fewer zero bytes than a header before other bytes, which EDK2's export into its old buffer can leave, or up to the end of the buffer's EFI runtime region, each whole inside that region and ending with an EFI_HII_PACKAGE_END package exactly at its PackageLength (UEFI 2.11 §33.3.1.1), which the other ways do not require, at most 16 MiB in all. It takes the table's address as physical first, then as virtual. It does not support Xen: on aarch64, where `/chosen` has no `linux,uefi-system-table` and `/hypervisor/uefi` holds Xen's `xen,uefi-system-table`, it fails. On x86 it reads only where Linux exports /sys/firmware/efi/runtime-map (CONFIG_EFI_RUNTIME_MAP, which CONFIG_EFI selects with CONFIG_KEXEC_CORE: Linux v6.11 arch/x86/Kconfig:2001, :2054), which bounds its reads.
     The configuration that the firmware exports with HII ExportConfig() and lists as the EFI configuration table of `EFI_HII_CONFIG_ROUTING_PROTOCOL_GUID` (UEFI 2.11 §33.2.11.1) is read the same way: its text up to its first NUL CHAR16, inside the buffer's EFI runtime region.
 
-  `auto` moves on while a way finds its source absent (no vendor ACPI table file, no `HiiDB` variable, no EFI System Table that Linux locates, as on a BIOS boot or an aarch64 boot without UEFI, or no such configuration table) or fails otherwise, such as a table that fails its checks or a missing memory map, and stops at a refusal: kernel lockdown, the kernel refusing `/dev/mem` or `/proc/kcore` (no `CAP_SYS_RAWIO`, `CONFIG_STRICT_DEVMEM`), a file that the user may not read, or an unsafe operation without `--i-am-fine-to-brick-this-system`. Its error names each way that it tried, in order, with why, absent apart from refused; with `RUST_LOG=warn`, `uefisettings` logs each way that failed before the one that gave the HiiDB, and with `RUST_LOG=debug` also that way. A named way is the only one tried. `identify` checks the same ways for the HII backend: it finds none where each way finds its source absent, and assumes it, with a warning that `RUST_LOG=warn` shows, where a way's check fails or is refused, such as under kernel lockdown or without `CAP_SYS_RAWIO`. `--hii-source` and `--efivar-memory` may also follow the command; the UEFI Shell, Windows and macOS builds accept both and ignore them.
+  `auto` moves on while a way finds its source absent (no vendor ACPI table file, no `HiiDB` variable, no EFI System Table that Linux locates, as on a BIOS boot or an aarch64 boot without UEFI, or no such configuration table) or fails otherwise, such as a table that fails its checks or a missing memory map, and stops at a refusal: kernel lockdown, the kernel refusing `/dev/mem` or `/proc/kcore` (no `CAP_SYS_RAWIO`, `CONFIG_STRICT_DEVMEM`), a file that the user may not read, or an unsafe operation without `--i-am-fine-to-brick-this-system`. Its error names each way that it tried, in order, with why, absent apart from refused; with `RUST_LOG=warn`, `uefisettings` logs each way that failed before the one that gave the HiiDB, and with `RUST_LOG=debug` also that way. A named way is the only one tried. `identify` checks the same ways for the HII backend: it finds none where each way finds its source absent, and assumes it, with a warning that `RUST_LOG=warn` shows, where a way's check fails or is refused, such as under kernel lockdown or without `CAP_SYS_RAWIO`. `--hii-source` and `--efivar-memory` may also follow the command; the UEFI Shell, Windows and macOS builds refuse both as unexpected arguments. Linux refuses either where it reads no HiiDB of this machine: in `show-translations`, `variable`, `capsule` and `ilo`, in `get` and `set` where they take the Ilo backend, and where `-f` or the efivars dump of `--efivars` gives the HiiDB; and it refuses `--efivar-memory` in `identify`, whose efivar method only checks that the `HiiDB` variable exists, and with `--hii-source acpi` or `systab`, which never read that memory.
 * Library (`hii`) in Rust partially implements the UEFI Hii specification.
 * It parses the HiiDB op-codes into a DOM tree like representation which can be read by machines and humans.
 * It can ask questions about UEFI settings from HiiDB and get their answers.
 * The texts of a HiiDB and of EFI variables, such as prompts, helps and option texts, can hold characters that a terminal takes as commands, as a reordering of the text after them or as line breaks. The text output shows each control character (Unicode Cc), Bidi_Control character, U+2028 and U+2029 escaped as Rust's `char::escape_debug` spells it, such as `\u{1b}`, `\r` and `\u{202e}`, and `\` as `\\`, so that no text shows as another's escape; `hii show-ifr` shows a text's own line break as `\n` inside its line. A console that shows a character as another, such as edk2's VT100 terminal showing U+2510 as `\`, can still make a text look like an escape. `--json` keeps each text exact, and spells U+007F to U+009F, Bidi_Control characters, U+2028 and U+2029 as JSON `\u` escapes, which JSON parsers read back as those characters. `set` and `hii set` match VALUE and `--item` against the raw texts only, whether a prompt, a QuestionId or a keyword selects the question: a shown text that holds an escape matches only an option whose raw text is that text. The UEFI Shell build also escapes each character that `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.TestString()` of the console it prints to refuses, as `\u{10d}` in text and as a JSON escape in a JSON string, as edk2's VT100 and PC-ANSI terminals would write such a character's low byte, such as CR for U+010D; it fails rather than print where that call fails. Every build escapes U+FFF0 and U+FFF1, which edk2's GraphicsConsole takes as a lasting change of the width of the characters after them, as `\u{fff0}` and `\u{fff1}` in text and as JSON escapes.
-* `get`, `set` and `hii list-questions` evaluate the `suppressif`, `grayoutif` and `disableif` conditions of questions as EDK2's setup browser does, and select only questions that none of them suppresses, grays out or disables, unless `--include` names that state (`grayed-out`, `suppressed`, `disabled`); an answer ends with the state of a question that is not selectable. Where a condition cannot be evaluated from Linux, `set` refuses the question, while `get` and `hii list-questions` show it with the states it may be in and why. A one-of option in a `suppressif` counts as suppressed, and a question that a `locked` (`EFI_IFR_LOCKED`) locks as grayed out. UEFI 2.11 §33.3.8.3.37 addresses LOCKED to Forms Editors; uefisettings follows edk2-stable202608 SetupBrowserDxe, which grays out a locked statement and every statement of a locked form (Presentation.c InitializeDisplayStatement, IfrParse.c ParseOpCodes).
+* `get`, `set` and `hii list-questions` evaluate the `suppressif`, `grayoutif` and `disableif` conditions of questions as EDK2's setup browser does, and select only questions that none of them suppresses, grays out or disables, unless `--include` names that state (`grayed-out`, `suppressed`, `disabled`); an answer ends with the state of a question that is not selectable. A form under a `disableif` outside forms whose condition is true holds no question, as UEFI 2.11 §33.3.8.3.14 has a Forms Processor not process it, evaluated once at its initialization (§33.2.5.2.1), and edk2-stable202608 SetupBrowserDxe does not parse it: no `--include` selects its questions; only `--keyword` finds them, as edk2's keyword handler does, and a condition that refers to one finds no such question, which edk2 evaluates as UNDEFINED. Where the `disableif`'s condition relies on more than constants (§33.3.8.3.14), or a true or non-constant `suppressif` or `grayoutif`, or another op whose expression edk2 evaluates there, such as a `value`, comes before the form in its scope with no `disableif` ending between them, which edk2 takes for the `disableif`'s, the questions of the form may be disabled. Where a condition cannot be evaluated from Linux, `set` refuses the question, while `get` and `hii list-questions` show it with the states it may be in and why. A one-of option in a `suppressif` counts as suppressed, and a question that a `locked` (`EFI_IFR_LOCKED`) locks as grayed out. UEFI 2.11 §33.3.8.3.37 addresses LOCKED to Forms Editors; uefisettings follows edk2-stable202608 SetupBrowserDxe, which grays out a locked statement and every statement of a locked form (Presentation.c InitializeDisplayStatement, IfrParse.c ParseOpCodes).
 * `set` refuses a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only (UEFI 2.11 §33.3.8.2.2), as EDK2's keyword handler does, unless `--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)), and always one that an `EFI_IFR_VALUE` makes read-only (§33.3.8.3.88), before it writes any question; the refusal names the states to include to select a question of the same text that `set` writes, if any: a writable one, and, with that flag, one that `EFI_IFR_FLAG_READ_ONLY` makes read-only. Of questions with the same text, `get` and `set` pick a writable one first among matches equally certain to be selected. `get`, `hii get` and `hii list-questions` show read-only questions.
 * Where efivarfs lacks the variable of a question, as the firmware has not created it or gives it no runtime access, `get`, `hii list-questions` and `hii show-ifr` take its value from the current configuration that edk2 firmware exports with `ExportConfig()` at ReadyToBoot when built with `PcdHiiOsRuntimeSupport`, its default (UEFI 2.11 §33.2.11.1); so do the questions of name/value storage, which no EFI variable holds. uefisettings reads that snapshot on x86, x86_64 and arm64 from `/dev/mem`, as it reads the HiiDB that the configuration table lists. A value from it ends with ` <snapshot>`, as does the option of a ONE_OF that such a value in the EFI_IFR_VALUE of an option of Type OTHER decides, and so does the state that a condition decides from such a value, even selectable (` <selectable> <snapshot>`); `get` refuses a question that such a state excludes, naming the snapshot. `set` never reads the snapshot: it refuses those questions as without it. No snapshot is read with `--efivars` or `--no-efivars`, where the firmware lists none, or where `/dev/mem` cannot be read (without root, or under a kernel lockdown). The bytes of PASSWORD questions are dropped from it, so a question over them shows withheld, and a PASSWORD question whose VarStore is unknown, or IFR that uefisettings ignores, which may hold one, keeps the whole snapshot off, as uefisettings could not withhold the bytes of that password.
 * Each question that `get`, `set` and `hii list-questions` print lists the Flags of its question header that are set (UEFI 2.11 §33.3.8.2.2), such as `READ_ONLY` and `RESET_REQUIRED`, in `flags`. A question of a FormSet whose ClassGuids hold `EFI_HII_REST_STYLE_FORMSET_GUID` lists `REST_STYLE`, which its Flags can then omit.
@@ -305,7 +338,7 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
 * A date or time question whose UEFI Storage is the system time or the wake-up time, its EFI Date/Time Storage (UEFI 2.11 §33.2.5.6), keeps its value there, in addition to its VarStore, if any. In the UEFI Shell, `get` shows the fields of GetTime()'s or GetWakeupTime()'s time, or the status of the service that fails, and `set` reads that time first, changes the question's fields, keeps the others, the TimeZone and Daylight too, and writes it back with SetTime() or SetWakeupTime(TRUE, …), then writes the question's VarStore, if any; where that write fails, the error names the time written. `set` of a wake-up time thus arms the alarm, which "causes the system to wake up or power on at the set time" (UEFI 2.11 §8.3.4), as EDK2's setup browser does (edk2-stable202608 SetupBrowserDxe/Setup.c:2051). Before any write, `set` refuses a time outside the ranges of UEFI 2.11 §8.3.1, such as a year before 1900. A GET or SET of a date or time without a VarStore, which conditions and WRITE expressions may hold, reads or writes a field of GetTime()'s time, as EDK2's setup browser does. On Linux, Windows and macOS, which reach no Time Services, `get` shows `<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read only through GetTime(); run uefisettings.efi in the UEFI Shell>` (GetWakeupTime() for a wake-up time), also where the ExportConfig snapshot holds the bytes of its VarStore, as that snapshot holds no EFI_TIME, and `set` refuses the question, with every other question that it selects, before any write.
 * An ordered-list question (UEFI 2.11 §33.2.5.4.8, §33.3.8.3.53) holds its items in up to MaxContainers containers, each as wide as the Type of its first option, as EDK2's setup browser sizes them (edk2-stable202608 SetupBrowserDxe/IfrParse.c), and a container of 0 ends them. `get` and `hii list-questions` show the texts of the options of its items in order, joined by `, `, each with the state of its option, such as `USB <option suppressed>`, and `--json` lists them without states as `items`; without a value they show its default, whose missing containers are empty. An option flagged as a default gives that default instead of an option, as in EDK2's setup browser. `set` takes the items with `--item TEXT`, once per container, in order, instead of VALUE, and writes the rest of the containers empty. Before any write, it refuses more items than MaxContainers, fewer under `EFI_IFR_NO_EMPTY_SET`, an option twice under `EFI_IFR_UNIQUE_SET`, an item whose option conditions hide unless `--include` selects its state, and a list that drops a stored item whose option conditions hide: `--include suppressed` with that item keeps it.
 * A cross-reference question (UEFI 2.11 §33.2.5.4.10, §33.3.8.3.59) on a VarStore holds an `EFI_HII_REF`, which `get` and `hii list-questions` show as `QuestionId 0x0005, FormId 0x0001, FormSetGuid 8C78A505-BAA0-4C4A-869F-000000000502, DevicePath "PciRoot(0x0)/Pci(0x1,0x0)"`: the DevicePath as the text of its string in the language of the other texts, `DevicePath none` for string 0, which links within the device path of the question's form set, or `DevicePath string 0x0063 not found` for a string without a text in that language or a display language; without a value they show its default of Type `EFI_IFR_TYPE_REF`. Any of `EFI_IFR_REF` to `EFI_IFR_REF5` holds one on a VarStore, as in EDK2's setup browser (edk2-stable202608 SetupBrowserDxe/IfrParse.c), though the spec gives storage to `EFI_IFR_REF5` only. The value is the target of the question's link, not a setting, so `set` refuses it before any write: `cannot set question "…": set does not write the EFI_HII_REF of a cross-reference question, the target of its link (UEFI 2.11 §33.2.5.4.10)`. A cross-reference question without a VarStore is a link with no value, which is not listed.
-* A string question (UEFI 2.11 §33.2.5.4.9, §33.3.8.3.70) holds MaxSize CHAR16s of UCS-2 (UEFI 2.11 §33.2.6), as EDK2's setup browser sizes them (edk2-stable202608 SetupBrowserDxe/IfrParse.c:2225). `get` and `hii list-questions` show its characters up to the first NULL, all MaxSize of them without one, and refuse a UTF-16 surrogate, which UCS-2 has no character for; without a value they show its default, the text of its string in the language of the other texts, cut to MaxSize characters, or `unknown (…)` for a string that the package list lacks or that holds a character beyond UCS-2: the string of an `EFI_IFR_DEFAULT`, else of a flagged `EFI_IFR_ONE_OF_OPTION` of Type `EFI_IFR_TYPE_STRING` that no `EFI_IFR_SUPPRESS_IF` hides, as EFI_IFR_STRING (UEFI 2.11 §33.3.8.3.70) orders them; EDK2's setup browser takes them from the ALTCFG defaults that HiiDatabaseDxe/ConfigRouting.c builds (:3218-3235) for storage other than a VARSTORE_EFI before UEFI 2.3.1 (EFI_HII_VARSTORE_EFI_VARIABLE, edk2-stable202608 SetupBrowserDxe/Setup.h:104, IfrParse.c:1901-1910), in a form set with EFI_HII_CONFIG_ACCESS_PROTOCOL (Setup.c:4449), and skips them for that storage (Setup.c:4140); its fallback takes the options of one-of questions alone (Setup.c:4525). `set` writes at most MaxSize − 1 characters of VALUE, NULL-padded to MaxSize CHAR16s, so that a NULL ends them: UEFI 2.11 §33.2.5.4.9 says "the buffer size must exceed the size of the NULL-terminated string". EDK2's setup browser takes MaxSize characters (edk2-stable202608 DisplayEngineDxe/InputHandler.c:260), which its Library/UefiHiiLib/HiiLib.c:1833 then reads past, so that DriverSampleDxe/DriverSample.c:2012-2022 unloads the driver, and on which MdePkg BaseLib/SafeString.c:256-259 StrCpyS fails. Before any write, `set` refuses more characters than that, fewer than MinSize, as EDK2's setup browser does, every VALUE of a string question of MaxSize 0 or of a MinSize above MaxSize − 1, a NULL, a character beyond UCS-2, a character of the Private Use Area U+E000..U+F8FF, of which UEFI 2.11 §33.2.6.2.1 says "UEFI prohibits use of this area in a UEFI environment.", other than the Common Control Codes U+F620..U+F62B and U+F700..U+F8FF, font display hints that UEFI 2.11 §33.2.6.2.4 Table 33.3 allows within strings, and a Mandatory Break of UEFI 2.11 §33.2.6.2.5 Table 33.4 (U+000A, U+000C, U+000D, U+2028 or U+2029) without the flag `EFI_IFR_STRING_MULTI_LINE` of EFI_IFR_STRING (UEFI 2.11 §33.3.8.3.70), which says "If it is clear, then multi-line editing should not be allowed." EDK2's setup browser ignores that flag, ends input at a carriage return and stores any other character typed, a line feed and the Private Use Area too (InputHandler.c:208, :256-262). A string question of name/value storage shows no value from the `ExportConfig()` snapshot, whose settings of that storage uefisettings keeps as numbers only.
+* A string question (UEFI 2.11 §33.2.5.4.9, §33.3.8.3.70) holds MaxSize CHAR16s of UCS-2 (UEFI 2.11 §33.2.6), as EDK2's setup browser sizes them (edk2-stable202608 SetupBrowserDxe/IfrParse.c:2225). `get` and `hii list-questions` show its characters up to the first NULL, all MaxSize of them without one, and refuse a UTF-16 surrogate, which UCS-2 has no character for; without a value they show its default, the text of its string in the language of the other texts, cut to MaxSize characters, or `unknown (…)` for a string that the package list lacks or that holds a character beyond UCS-2: the string of an `EFI_IFR_DEFAULT`, else of a flagged `EFI_IFR_ONE_OF_OPTION` of Type `EFI_IFR_TYPE_STRING` that no `EFI_IFR_SUPPRESS_IF` hides, as EFI_IFR_STRING (UEFI 2.11 §33.3.8.3.70) orders them; EDK2's setup browser takes them from the ALTCFG defaults that HiiDatabaseDxe/ConfigRouting.c builds (:3218-3235) for storage other than a VARSTORE_EFI before UEFI 2.3.1 (EFI_HII_VARSTORE_EFI_VARIABLE, edk2-stable202608 SetupBrowserDxe/Setup.h:104, IfrParse.c:1901-1910), in a form set with EFI_HII_CONFIG_ACCESS_PROTOCOL (Setup.c:4449), and skips them for that storage (Setup.c:4140); its fallback takes the options of one-of questions alone (Setup.c:4525). `set` writes at most MaxSize − 1 characters of VALUE, NULL-padded to MaxSize CHAR16s, so that a NULL ends them: UEFI 2.11 §33.2.5.4.9 says "the buffer size must exceed the size of the NULL-terminated string". EDK2's setup browser takes MaxSize characters (edk2-stable202608 DisplayEngineDxe/InputHandler.c:260), which its Library/UefiHiiLib/HiiLib.c:1833 then reads past, so that DriverSampleDxe/DriverSample.c:2012-2022 unloads the driver, and on which MdePkg BaseLib/SafeString.c:256-259 StrCpyS fails. Before any write, `set` refuses more characters than that, fewer than MinSize, as EDK2's setup browser does, every VALUE of a string question of MaxSize 0 or of a MinSize above MaxSize − 1, a NULL, a character beyond UCS-2, a character of the Private Use Area U+E000..U+F8FF, of which UEFI 2.11 §33.2.6.2.1 says "UEFI prohibits use of this area in a UEFI environment.", other than the Common Control Codes U+F620..U+F62B and U+F700..U+F8FF, font display hints that UEFI 2.11 §33.2.6.2.4 Table 33.3 allows within strings, and a Mandatory Break of UEFI 2.11 §33.2.6.2.5 Table 33.4 (U+000A, U+000C, U+000D, U+2028 or U+2029) without the flag `EFI_IFR_STRING_MULTI_LINE` of EFI_IFR_STRING (UEFI 2.11 §33.3.8.3.70), which says "If it is clear, then multi-line editing should not be allowed." EDK2's setup browser ignores that flag, ends input at a carriage return and stores any other character typed, a line feed and the Private Use Area too (InputHandler.c:208, :256-262). A string question of name/value storage takes its characters from its setting in the `ExportConfig()` snapshot, 4 hex digits each, most significant first, as EDK2's setup browser reads them (edk2-stable202608 SetupBrowserDxe/Setup.c:1564-1579): up to a NULL, as UEFI 2.11 §33.2.5.4.9 ends the hex dump, or MaxSize characters, as Setup.c writes them without one (:2139-2148); an empty setting is an empty string. A setting whose digits are no `<String>` (UEFI 2.11 §35.2.1.2), whose last CHAR16 Setup.c would take from fewer than 4 digits (:1571-1573), or that holds characters other than NULL past MaxSize, which Setup.c would cut (:1557-1561), gives no value.
 * `set` gives one value to every question that it selects, so where it selects questions of more than one kind, such as a numeric question and a date, it refuses them all before any write, naming each kind and the package lists of its questions.
 * Before the first write, `set` checks that it cannot crash Linux: Linux v5.8 (f88814cc2578; stable 5.7.11) to v6.7 without the upstream fix 0e8d2444168d crash on an efivarfs write when the firmware's `EFI_RT_PROPERTIES_TABLE` leaves out `SetVariable()`. It writes when `/proc/kallsyms` names `efivarfs_reconfigure`, the function of that fix, or, on x86_64 and on aarch64 from Linux v5.14, when the `set_variable` of Linux's `generic_ops`, which it reads through `/proc/kcore` (unless `lockdown=confidentiality`) at the address that `/proc/kallsyms` gives, is a `*_set_variable` function, and refuses when that `set_variable` is NULL. Where neither tells, it writes when the kernel log (`/dev/kmsg`, or `syslog(2)` under `printk.devkmsg=off`) names no such table that Linux applied, and else, on x86, x86_64 and aarch64, reads the table itself from `/dev/mem` as `capsule config-data` reads its table, unless the kernel lockdown mode refuses `/dev/mem`: it writes when the table lists `SetVariable()`, or the firmware lists no such table, and refuses when the table leaves it out. Otherwise it refuses, and `uefisettings.efi` in the UEFI Shell can change the setting.
 * Questions read and set their EFI variable by its own attributes, as efivarfs gives them, since firmware may give a variable runtime access that its form does not declare. The attributes that the form (`VARSTORE_EFI`) declares explain only a variable that efivarfs does not list, or none read under `--no-efivars`.
@@ -357,7 +390,7 @@ make help            # lists the checks
 
 On macOS, whose make 3.81 ignores the `Makefile`'s `.SHELLFLAGS`, `brew install make` installs GNU make as `gmake`: `gmake setup test` runs the unit tests.
 
-GitHub Actions runs the checks, and the unit tests on arm64 and Intel Macs and on x86_64 Windows, on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes.
+GitHub Actions runs the checks on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes: `lint`, and each system's tests as a check of its own, named after the system: the unit tests on x86_64, i686 and aarch64 Linux, arm64 and Intel Macs and x86_64 and aarch64 Windows, and the QEMU tests of Linux and of the UEFI Shell on each of their 3 architectures.
 
 ## QEMU tests
 
@@ -411,26 +444,45 @@ they would create absent variables and overwrite writable ones, such as BootOrde
 </details>
 
 <details>
-<summary>AMI Setup access level</summary>
+<summary>Stated VarStore bytes</summary>
 
-AMI firmware's Setup grays out or hides some questions by the access level of its session, which
-it keeps in the VarStore `SystemAccess` (E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator,
-1 User). Where Linux cannot read that variable, those questions are undetermined, and `set`
-refuses them unless `--include` selects their states, such as `grayed-out`.
-`--access-level administrator|user`, on `get`, `set`, `hii get`, `hii set` and
-`hii list-questions`, evaluates those conditions at the stated level instead, and fails on a
-HiiDB that declares no `SystemAccess`:
+Conditions that read bytes the OS cannot read, such as those of a buffer VarStore that only its
+driver's `EFI_HII_CONFIG_ACCESS_PROTOCOL` holds, or of an EFI variable without runtime access, are
+undetermined, and `set` refuses the questions they may gray out or hide unless `--include` selects
+those states. The reason names the bytes:
 
-```sh
-uefisettings hii list-questions --access-level administrator
+```text
+<ValueUnavailable: no EFI variable Setup-8be4df61-93ca-11d2-aa0d-00e098032b8c; HII buffer varstore
+requires EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store
+Setup-8be4df61-93ca-11d2-aa0d-00e098032b8c+5=<HEX of 1 byte> states it>
 ```
 
-`--access-level` changes no variable: the questions on `SystemAccess` itself still answer with its
-stored value, or why it cannot be read.
+`--assume-var-store NAME-GUID[+OFFSET]=HEX`, on `get`, `set`, `hii get`, `hii set` and
+`hii list-questions`, evaluates conditions as if that VarStore held the bytes HEX, two hex digits
+each, from byte OFFSET of its payload on (decimal, or hexadecimal after `0x`; default 0). NAME-GUID
+is the name of the variable's efivar file, as the reason prints it. Repeat it to state more bytes.
+It refuses a VarStore that no FormSet of the HiiDB declares, bytes past its Size, and bytes stated
+twice.
+
+Stated bytes change states, and the option lists and defaults that conditions pick, never a write:
+the questions on those bytes still answer with what their variable holds, or why it cannot be
+read, and `set` writes the variable, never the stated bytes. A question whose `EFI_IFR_VALUE` or
+`READ` expression reads them answers with what it computes from them, and the `EFI_IFR_WRITE`
+expression of a question that `set` writes reads them as conditions do, as does an `EFI_IFR_GET`.
+
+For example, AMI firmware's Setup grays out or hides some questions by the access level of its
+session, which it keeps at byte 0 of the VarStore `SystemAccess`
+(E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User). To list the questions of an
+Administrator session:
+
+```sh
+uefisettings hii list-questions \
+  --assume-var-store SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac=00
+```
 
 uefisettings never takes, checks or circumvents a firmware password, because UEFI variable writes
-carry none. With an Administrator password installed, `administrator` lets root select from the OS
-the questions that the firmware's Setup reserves for Administrator sessions, as
+carry none. With an Administrator password installed, stating `00` there lets root select from the
+OS the questions that the firmware's Setup reserves for Administrator sessions, as
 `--include grayed-out` already does more broadly.
 
 </details>
@@ -544,17 +596,18 @@ and `set` refuses it, with or without a VarStore:
 | READ only | the value of READ | refused: nothing keeps a changed value |
 | WRITE only | refused: no value to retrieve | through WRITE |
 | neither, nor EFI_IFR_FLAG_CALLBACK | refused: one of them is required | refused |
-| EFI_IFR_FLAG_CALLBACK only | refused: its driver keeps the value | refused |
-| EFI_IFR_FLAG_CALLBACK with READ (get) or WRITE (set) | refused: its driver's CallBack() may override the expression | refused |
+| EFI_IFR_FLAG_CALLBACK only | its driver's CallBack(): see below | its driver's CallBack(): see below |
+| EFI_IFR_FLAG_CALLBACK with READ (get) or WRITE (set) | as above, but refused where RETRIEVE fails: uefisettings does not evaluate READ beside CallBack() | refused before any write: uefisettings does not evaluate WRITE beside CallBack() |
 
 `get` refuses too where READ gives no value, as no stored value takes its place, and `set` where
 WRITE sets no VarStore. A browser lets the driver override READ with
 CallBack(EFI_BROWSER_ACTION_RETRIEVE) and calls CallBack() around WRITE, so a question with
 EFI_IFR_FLAG_CALLBACK is its driver's to answer. On Linux, Windows and macOS, which run after
-ExitBootServices(), when no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6), the
-refusal points to `uefisettings.efi` in the UEFI Shell, which calls no CallBack() yet and refuses
-it as well. `hii list-questions` and `hii show-ifr` never call CallBack(): they show such a
-question with the refusal of `get`.
+ExitBootServices(), when no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6), `get`
+refuses such a question and points to `uefisettings.efi` in the UEFI Shell, which calls CallBack():
+see the UEFI Shell details; `set` on Linux and Windows stages it for the next boot instead: see the
+sets staged for the next boot. `hii list-questions` and `hii show-ifr` never call CallBack(): they
+show such a question with the refusal of `get`.
 
 </details>
 
@@ -583,6 +636,13 @@ of the file only when it lists or writes the variable but reads the variable fro
 each read; a variable without runtime access is missing there, and so is one that the firmware
 dropped after efivarfs listed it. On Windows it reads all of the data through
 GetFirmwareEnvironmentVariableExW, which tells the size no other way, and prints none of it.
+Of a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, it also prints `metadata`, the
+EFI_VARIABLE_AUTHENTICATION_3 headers that GetVariable() returns before the data (UEFI 2.11 §8.2.1),
+which `size` counts: `version`, `type`, 1 for a TimeStamp or 2 for a nonce, `metadata_size`,
+`flags`, then `time_stamp` as YYYY-MM-DDTHH:MM:SSZ, or `nonce`, the current nonce, which the next
+update signs (§8.2.5), as `{"hex": ...}`, then `cert_id`, its `type` and `id`; metadata that
+uefisettings does not take shows as `{"refused": WHY}`. In the UEFI Shell it reads the data of such
+a variable for it, and of no other.
 `uefisettings.efi` keeps `hii variable-info` for it.
 
 ```plain
@@ -603,8 +663,11 @@ and each reserved bit in hex; `SecureBoot`, `SetupMode`, `AuditMode`, `DeployedM
 `devAuthBoot` and `HwErrRecSupport` are their number; `BootOptionSupport` lists its flags and its
 key press `count`; `SignatureSupport` and `OsRecoveryOrder` list their GUIDs; `PK`, `KEK`, the
 signature databases and their `*Default` list their EFI_SIGNATURE_LISTs, each a `type` GUID and its
-`signatures`, each an `owner` GUID and the `sha256` of its data. The load options, hot keys and
-device paths of §3.3 are left to `variable info`.
+`signatures`, each an `owner` GUID and the `sha256` of its data. Boot####, Driver####, SysPrep####,
+PlatformRecovery#### and, of the GUID given, OsRecovery#### show `attributes`, `category`,
+`description`, `device_paths` as text and `optional_data` in hex; Key#### shows `revision`,
+`modifiers`, `keys`, `boot_option` and `crc_matches`; ConIn, ConOut, ErrOut and their *Dev show
+their device path as text.
 
 ```sh
 uefisettings variable get SecureBoot
@@ -656,6 +719,93 @@ firmware departure that set reports as returned.
 
 ```plain
 FS0:\> uefisettings.efi variable set DeployedMode 1 --i-am-fine-to-brick-this-system
+```
+
+`variable set-attributes NAME [--set FLAGS] [--clear FLAGS] [--category CATEGORY]` changes the
+Attributes (UEFI 2.11 §3.1.3) of a Boot####, Driver#### or SysPrep#### of EFI_GLOBAL_VARIABLE:
+`--set` and `--clear` take the flags `active`, `force-reconnect` and `hidden`, comma-separated, and
+`--category` `boot` or `app` gives the LOAD_OPTION_CATEGORY field a value, clearing the whole field
+first, a reserved value too; no flag names the bit of LOAD_OPTION_CATEGORY_APP. It patches the
+Attributes in place: "When updating a load option, all undefined attribute bits must be preserved",
+and every other byte stays as read, which a decode and encode would not keep for a Description
+holding a surrogate. The variable keeps its attributes. It prints the load option as `variable get`
+shows it. A Key#### starts its Boot#### only while its BootOptionCrc is the CRC-32 of that Boot####
+(§3.1.6), so after writing a Boot####, set-attributes sets the BootOptionCrc of each Key#### whose
+BootOption names it and whose BootOptionCrc was the CRC-32 of its old bytes to that of the new ones,
+every other byte kept, and prints each Key#### updated on stderr. A Key#### that is malformed, names
+another Boot#### or was already stale stays as it was. A Key#### write that fails names the Boot####
+as written, the Key#### updated and each one left with the old BootOptionCrc. Windows, whose calls
+cannot list variables, finds none, and set-attributes warns that the Key#### that name the Boot####
+are now ignored there. It refuses, before any write, PlatformRecovery####, which "are only modified
+by firmware and are read-only to the OS" (§3.3), OsRecovery####, a Secure Boot Policy Variable that
+needs EFI_VARIABLE_AUTHENTICATION_2 (§3.3), any other variable, an absent load option, a change of
+nothing and a flag both to set and to clear. It refuses too a load option, or a Key#### following
+it, whose attributes hold EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS or
+EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which only an EFI_VARIABLE_AUTHENTICATION_3 or
+_2 descriptor writes (§8.2.3).
+
+```sh
+uefisettings variable set-attributes Boot0001 --clear active
+```
+
+`variable create-load-option NAME --description TEXT (--device-path TEXT... | --device-path-file
+FILE...) [--optional-data-file FILE] [--flags FLAGS] [--category CATEGORY]` creates a Boot####,
+Driver#### or SysPrep#### of EFI_GLOBAL_VARIABLE that does not exist, with NV+BS+RT (UEFI 2.11 Table
+3.1): `--description` takes its Description, UCS-2 text without Null; `--device-path` takes a device
+path as `variable get` shows it, read back to bytes, once per device path of its FilePathList, the
+first of which locates the image; `--device-path-file` takes instead a file of the bytes of one, an
+EFI_DEVICE_PATH_PROTOCOL, which the FilePathList decoder checks and nothing changes;
+`--optional-data-file` takes its OptionalData, bytes never decoded, none if not given; `--flags` and
+`--category` take its Attributes, `active` and `boot` if not given, and `--flags none` no flag, so
+that an app that is not active, Attributes 0x100, takes one write: "When creating a new load option,
+all undefined attribute bits must be written as zero" (§3.1.3). It refuses an existing load option:
+`variable set-attributes` changes one, and `variable set BootOrder` its place in BootOrder, which a
+new one stays out of. A SysPrep#### while BootOptionSupport lacks EFI_BOOT_OPTION_SUPPORT_SYSPREP,
+and an app Boot#### while it lacks EFI_BOOT_OPTION_SUPPORT_APP, get a warning on stderr and are
+written all the same (§3.1.4); an absent BootOptionSupport supports neither. The category "is
+ignored for variables of the form Driver####, SysPrep####, or OsRecovery####" (§3.1.3), so theirs
+gets none. It prints what it wrote as `variable get` shows it, and refuses, before any write, a path
+that does not read or decode.
+
+```sh
+uefisettings variable create-load-option Boot0005 --description UiApp --device-path 'Fv(7CB8BDC9-F8EB-4F34-AAEA-3EE4AF6516A1)/FvFile(462CAA21-7614-4503-836E-8AB6F4662331)'
+```
+
+`variable set-device-path NAME (--device-path TEXT | --device-path-file FILE)` sets ConIn, ConOut or
+ErrOut to one device path, from text or a file of its bytes, keeping the variable's attributes, or
+with NV+BS+RT if it is missing. ConIn, ConOut and ErrOut "are always proper subsets of ConInDev,
+ConOutDev, and ErrOutDev" (UEFI 2.11 §3.3), so each instance that the `*Dev` variable lacks gets a
+warning on stderr, but one holding a USB Class or USB WWID node, which the firmware matches to the
+devices of that class or WWID (edk2-stable202608 ConPlatformDxe MatchUsbShortformDevicePath()); the
+write still proceeds. It refuses ConInDev, ConOutDev and ErrOutDev, which "are volatile, and are set
+dynamically on every boot". It prints what it wrote as `variable get` shows it, and refuses, before
+any write, a path that does not read or decode, and alike a console variable whose attributes hold
+EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS or EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+which only an EFI_VARIABLE_AUTHENTICATION_3 or _2 descriptor writes (§8.2.3).
+
+```sh
+uefisettings variable set-device-path ConOut --device-path 'PciRoot(0x0)/Pci(0x1F,0x0)/Serial(0x0)/Uart(115200,8,N,1)/VenUtf8()'
+```
+
+`variable create-key NAME --boot BOOT [--modifiers MODIFIERS] [--key KEY]...` creates a Key#### of
+EFI_GLOBAL_VARIABLE that does not exist, with NV+BS+RT, a hot key that starts a Boot#### (UEFI 2.11
+§3.1.6): `--boot` takes the Boot####, which must exist; BootOptionCrc gets the CRC-32 of its
+EFI_LOAD_OPTION, the bytes after any EFI_VARIABLE_AUTHENTICATION_3 metadata (§8.2.1), without which
+the boot manager ignores the key; `--modifiers` takes the shift states to hold, of `shift`,
+`control`, `alt`, `logo`, `menu` and `sys-req`, comma-separated, none if not given; `--key` takes
+each key, 0 to 3, as InputKeyCount counts them, by the name after `SCAN_` of its scan code in edk2's
+SimpleTextIn.h and SimpleTextInEx.h, such as `F2`, `ESC` or `EJECT`, else by its one UCS-2
+character, else as `ScanCode=0x####,UnicodeChar=0x####`, which `variable get` shows for any other
+key. KeyData gets Revision 0 and no Reserved bits, as the spec's examples. It prints the key as
+`variable get` shows it. It refuses, before any write, an existing Key####, a missing Boot####, a
+BootOptionSupport without EFI_BOOT_OPTION_SUPPORT_KEY or with an EFI_BOOT_OPTION_SUPPORT_COUNT below
+the keys (§3.1.4), an absent one supporting none, and the shift states and keys of a Key#### that
+the boot manager takes, as its Boot#### exists and its BootOptionCrc matches: edk2-stable202608
+EfiBootManagerAddKeyOptionVariable() (BmHotkey.c) refuses those too. Windows, whose calls cannot
+list variables, cannot check the last; create-key warns there and writes the key all the same.
+
+```sh
+uefisettings variable create-key Key0005 --boot Boot0001 --modifiers alt --key F11
 ```
 
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)
@@ -742,11 +892,17 @@ certificate a WIN_CERTIFICATE_UEFI_GUID of PKCS #7 on a 4-byte boundary after ze
 the structures out, and MetadataSize their size, then the data. With `--data-file`, KEY signs over
 SHA-256 or the `--digest`, as above, and `--timestamp TIME` or `--nonce HEX` gives the Type; the
 firmware takes only a TimeStamp later than the variable's, or a nonce other than its own, and makes
-one for an all-zero nonce where it can. `--current-nonce HEX`, the variable's nonce, is required to
+one for an all-zero nonce where it can. `--current-nonce HEX`, the variable's nonce, which by
+default is the one that its metadata holds (§8.2.1), is signed to
 update a NONCE variable, and `--new-signing-key-file KEY2 --new-signing-certificate-file
 CERTIFICATES2` adds a NewCert, which KEY2 signs over the same digest and which hands the variable
-to KEY2; with it, the data may be empty, to change the certificate alone. uefisettings does not
-compare these with the stored variable: the firmware does. Before it seeds or writes, it refuses a
+to KEY2; with it, the data may be empty, to change the certificate alone. With `--data-file`,
+uefisettings reads the variable first and refuses, as the firmware would, attributes other than
+its own but `append` (§8.2.3), another Type, a TimeStamp not later than its own, its own nonce
+unless all zero, and a `--current-nonce` other than its nonce or for a variable that does not
+exist (§8.2.5); it checks neither the payload of `--payload-file` against the variable nor the
+signer: the firmware does. A variable that it cannot read, or whose metadata it does not take, it
+does not write. Before it seeds or writes, it also refuses a
 write without data or NewCert, which would delete the variable, a Secure Boot policy variable,
 which takes only an EFI_VARIABLE_AUTHENTICATION_2, a device signature database while SetupMode is
 1, as above, and on Linux every such write, as efivarfs lacks the attribute (EFI_VARIABLE_MASK in
@@ -856,7 +1012,13 @@ A failing command returns EFI_ABORTED, which `%lasterror%` shows as 0x15 (0x8000
 
 The UEFI Shell runs no setup browser, so nothing there asks for or checks a setup password: in a
 HiiDB that declares a password question, `set` writes nothing unless
-`--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)).
+`--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)). A set
+staged for the next boot follows the same rule, as `apply-staged` applies it before the OS: on
+Linux and Windows, `set` stages a question whose value only its driver holds in such a HiiDB only
+with `--i-am-fine-to-brick-this-system`, which it records with the question and which
+`apply-staged` honours. Under Secure Boot, any `uefisettings.efi` that db trusts thus lets an OS
+administrator stage requests with `--i-am-fine-to-brick-this-system` that `apply-staged` honours
+before the OS, with no setup password: sign it only with keys whose machines accept that.
 
 `set` refuses a variable without EFI_VARIABLE_NON_VOLATILE unless `--allow-volatile` is given.
 The UEFI Shell runs before ExitBootServices, when SetVariable() still sets volatile variables
@@ -896,6 +1058,9 @@ written, as a number. It never writes a read-only question, which the Keyword Ha
 even with `--i-am-fine-to-brick-this-system`; else `--include`, that flag and `--allow-volatile`
 work as for `set`: the `<KeywordResp>` of a keyword whose variable is volatile
 ends with ` <volatile: lasts until the next reset or power cycle>`. `-j` prints JSON instead.
+`get` and `set` fail where GetData(), or SetData() and its read-back, changed the bytes of a
+password question, which uefisettings never writes back, or where it cannot compare those bytes
+across them, as it compares them across a Callback() sequence (below).
 A VALUE holds every byte that SetData() writes, last byte first, as edk2's GetValueOfNumber
 (ConfigRouting.c:518) and UEFI 2.11 §35.4.6's example read it, where §35.2.1.5 lists a
 `<Number>`'s bytes in memory order: of a DATE or TIME each field, which `set` takes as the digits
@@ -904,15 +1069,153 @@ ORDERED_LIST each container, whose options up to the first empty one `set` takes
 every container after it empty. A container is as wide as the Type of the ONE_OF_OPTION right
 after the ORDERED_LIST, as edk2's GetWidth takes it, where UEFI 2.11 §33.2.5.4.8 gives it one
 byte; a VALUE is refused where `set` writes containers of another width, that of the first option
-that is no default. A REF, whose EFI_HII_REF `set` does not write, and a STRING are refused.
+that is no default. A REF, whose EFI_HII_REF `set` does not write, is refused. Of a STRING, a
+VALUE holds all MaxSize CHAR16s, as edk2's GetWidth takes them, so `AB` of MaxSize 4 is
+`0000000000420041`; UEFI 2.11 §33.2.5.4.9 represents a STRING's result as "hex dump of the
+string, including the terminating NULL character", but a VALUE of fewer bytes is refused, as
+edk2-stable202608 ConfigRouting.c HiiConfigToBlock copies the question's width (:6353) from a
+buffer of half the VALUE's digits (:508-509): `set`'s checks take its text up to the first NULL,
+and a VALUE that is not the bytes that `set` writes for that text, NULL-padded (UEFI 2.11
+§33.2.5.4.9), or that holds a UTF-16 surrogate is refused.
 
 ```plain
 FS0:\> uefisettings.efi hii keyword get --namespace x-UEFI-ns KEYWORD=<keyword>
 FS0:\> uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=<hex digits>&KEYWORD=<keyword>&VALUE=<hex digits>"
 ```
 
+A question without a VarStore whose value only its driver keeps (EFI_IFR_FLAG_CALLBACK, UEFI 2.11
+§33.2.5.6) is reached through that driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.Callback(), with the
+browser actions that a forms browser sends, as no forms browser runs. `get` sends FORM_OPEN,
+RETRIEVE and FORM_CLOSE, and shows the value that RETRIEVE gave. Only `get` and `set` call a driver:
+`list-questions`, `show-ifr`, the dumps and `get --no-efivars` show why such a question has no
+value, and so does `get` on Linux, Windows and macOS, while `set` on Linux and Windows stages it for
+the next boot.
+
+uefisettings exchanges a value with Callback() only for a one-of, numeric or checkbox question: it
+refuses an ordered-list or string question, or a date or time question outside EFI Date/Time
+Storage, with EFI_IFR_FLAG_CALLBACK and no VarStore, and names its op. A Callback() names its question by
+QuestionId alone, "The unique value that identifies the particular question" (UEFI 2.11
+§33.3.8.2.2), so uefisettings calls none for a question whose QuestionId another question of its
+FormSet also has, such as a password question: it refuses that question and names the other's op.
+
+Each Callback() sequence runs between reads of the stores of the question's FormSet: of its Buffer
+and Name/Value stores by EFI_HII_CONFIG_ROUTING_PROTOCOL.ExtractConfig() of the settings that a
+forms browser requests, and of its EFI variable stores. A store that cannot be read refuses before
+the first Callback(). Settings that change between two reads before it, as a timestamp does, are
+listed and not compared. A store that the Callback()s changed is restored, a Buffer or Name/Value
+store by one RouteConfig() of all its settings, and the answer is refused: the driver has already
+acted on the change, and any effect outside the FormSet's stores stays. The reads never request the
+bytes of a PASSWORD question, and read them as zero in an EFI variable store, so a changed store
+that holds one is not restored, as a RouteConfig() without the password bytes may clear it and
+SetVariable() would write zeros over them. uefisettings compares those bytes apart, without showing
+them: in each EFI variable that holds one, listed by GetNextVariableName() or not, it reads them
+before the stores' first reads, refusing the answer where they cannot be read or listed, and again
+after the sequence, or after the reads that ran where a store cannot be read, and after a
+reconnection that a Callback() asks for. As uefisettings never writes a password byte, a change,
+or bytes that cannot be compared, then fails `get`, and `set` reports the change not applied, or
+applied and then refused by the reconnection.
+`get` of a question with a READ expression shows RETRIEVE's value, as a forms browser does. Where
+RETRIEVE fails, a forms browser keeps READ's value, but uefisettings does not evaluate READ beside
+a driver's Callback()s, so `get` refuses and says so. A Callback() that asks the forms browser to
+save the FormSet's modified values, which only a forms browser's edit buffer holds, or returns an
+ActionRequest that UEFI 2.11 §35.5.4 does not define refuses the answer too; a request for a
+platform reset or to discard modified values is noted.
+
+`set` sends FORM_OPEN, RETRIEVE, CHANGING with the new value, CHANGED and FORM_CLOSE, then reads the
+value back with FORM_OPEN, RETRIEVE and FORM_CLOSE, and answers `applied`, `applied; the driver now
+reports <value>` for a driver that resets a transient value, or `applied; the driver offers no
+read-back`. A forms browser never sends SUBMITTED for a question without storage, so `set` does not
+either. `set` refuses the change when CHANGING refuses the value or CHANGED fails, and, before any
+write, a question with a WRITE expression, which a forms browser evaluates between CHANGING and
+CHANGED and uefisettings does not evaluate beside a driver's Callback()s. A RECONNECT request after
+an applied change disconnects and reconnects the driver's controller.
+`set` sends the value to the drivers of the matches after it writes the EFI variables of the
+others, in order, and stops at the first driver that refuses it, as at a failed write: its error
+names each driver by the package list of its question, followed by `(its driver)`. In a HiiDB that
+declares a setup password question, and for a question that EFI_IFR_FLAG_READ_ONLY makes
+read-only, `set` through a driver is an unsafe operation, as for a stored question, which only
+`--i-am-fine-to-brick-this-system` lets through, before the first Callback() (see
+[Unsafe operations](#unsafe-operations)).
+
+`get` and `set` list every EFI variable that the sequence changed, as a Callback() may act outside
+the FormSet's stores, where nothing here can see it.
+
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
 machine's db trusts.
+
+</details>
+
+<details>
+<summary>Sets staged for the next boot</summary>
+
+Boot services, and with them every driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.Callback(), end at
+ExitBootServices(), so from Linux or Windows `set` cannot reach a question whose value only its
+driver holds. It stages the request instead: the next boot starts `uefisettings.efi` from the EFI
+system partition (ESP) before the OS, from a Boot#### load option that BootNext names (UEFI 2.11
+§3.1.2), and that applies the set as `set` in the UEFI Shell does.
+
+```sh
+uefisettings set "<question>" "<value>" --image uefisettings.efi
+```
+
+`--image` names the `uefisettings.efi` to stage; under Secure Boot it must be signed for db, as the
+firmware starts no image whose signature db lacks (UEFI 2.11 §32.4.2). `set` copies it to
+`\EFI\uefisettings\uefisettings.efi` on the ESP, only as a new file, and reads the copy back to
+compare its SHA-256; a file there already, which a `set` running at the same time may have placed,
+fails `set` and stays. Then it records the set in the EFI variable `UefisettingsStagedSet` of
+uefisettings' own vendor GUID, writes the lowest Boot#### that neither exists nor BootOrder or
+BootNext names, ACTIVE and HIDDEN and in no BootOrder, so that no boot starts it unattended, whose
+device path is the ESP's Hard Drive node and the image's File Path node, and last writes BootNext. A
+step that fails undoes the ones before it. A `set` before that boot appends its request to the
+staged set and needs no `--image`.
+
+The ESP is the partition that the Hard Drive node of BootCurrent's Boot#### names: a GPT partition
+by its UniquePartitionGUID, an MBR one by its disk signature and partition number. When that
+Boot#### has no Hard Drive node, it is the only ESP. Staging refuses when no partition or several
+match, and names each one and why it is no match. On Linux the ESP must be mounted, at a mount point
+that no later mount shadows. On Windows `set` finds it among the volumes and writes through its
+volume GUID path; where Windows does not let it, mount the ESP with `mountvol S: /s` and pass `--esp
+S:`, and `set` checks that the volume there is that ESP. Windows refuses these calls without
+Administrator, and `set` says so.
+
+`set` does not stage while BootNext names another Boot####, which staging would replace, while
+OsIndications asks the next boot for the firmware's user interface or for recovery, which would not
+start BootNext's option unattended (UEFI 2.11 §8.5.4), while OsIndications has
+FILE_CAPSULE_DELIVERY_SUPPORTED and `\EFI\UpdateCapsule` on the ESP holds a file, as processing that
+capsule on disk clears BootNext without starting its option (UEFI 2.11 §8.5.5), or while
+`\EFI\uefisettings` holds a file that the staged set does not name. `set` checks these, the ESP and
+`--image` before it writes any question. It stages after it writes the EFI variables of the other
+matches, as the UEFI Shell build sends the value to the drivers after them, and its error names a
+staged question by its package list, followed by `(staged for the next boot)`.
+
+Staging and `apply-staged` write no byte of a password question: a write over one fails, staging
+then undoes the steps before it, and `apply-staged` applies no request if it could not record its
+start. Where `apply-staged` cannot tell those bytes, as for a password question whose VarStore it
+does not find, it writes nothing, so `set` refuses to stage that set.
+
+Before the OS, `uefisettings.efi apply-staged <nonce>` records in `UefisettingsStagedOutcome` that
+it started, before the first Callback(), then sets each request's question through its driver's
+Callback()s, but none after one refused as driver code changed password bytes, or they could not
+be compared across it, and records each result. It checks each request as `set` does, against
+`--i-am-fine-to-brick-this-system` as `set` recorded it with the request (see
+[Unsafe operations](#unsafe-operations)): a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only
+by then, or a HiiDB that declares a setup password question, is applied only with it, and the
+result keeps a warning for each operation that the flag let through. A nonce whose outcome is
+recorded already applies nothing again, as when its Boot#### starts a second time after a crash or
+a failed deletion. It deletes the set's Boot#### and a BootNext that names it, but no other tool's
+BootNext, prints each result after its `warning:` lines and each deletion, and resets the platform
+cold, so that the OS starts in a boot whose boot path holds no `uefisettings.efi`. On Linux and
+Windows, `get` of such a question then shows what the records tell: its value staged for the next
+boot, or what the last staged boot did, which is applied, refused with the reason, stopped while it
+applied the set, which may then be partly applied, or never started, with the warnings of an
+applied or refused request.
+The next `set` that stages settles the old set: it records its outcome, which `get` keeps showing,
+and deletes its image and its record. The firmware may remove a Boot#### that nothing references
+(UEFI 2.11 §3.1.1); `set` deletes it otherwise, but not one that no longer holds the set's command
+line, nor an image whose SHA-256 changed.
+
+[UNVERIFIED] No firmware here has booted a copy that Windows staged, and `--esp` has not run through
+a real `mountvol` mount point.
 
 </details>

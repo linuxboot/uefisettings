@@ -19,9 +19,10 @@ set-bypass	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-b
 # and the variable stays as it was
 dmpstore-after	status	any
 dmpstore-after	same	dmpstore-before
-# the firmware holds the attributes and size that the scenario seeds
+# the firmware holds the attributes and size that the scenario seeds, and info shows the
+# metadata before the data (UEFI 2.11 §8.2.1)
 variable-info	status	0x0
-variable-info	json	. == {"variable": "EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301", "attributes": 135, "size": 72}
+variable-info	json	. == {"variable": "EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301", "attributes": 135, "size": 72, "metadata": {"version": 1, "type": 1, "metadata_size": 68, "flags": 0, "time_stamp": "2026-11-06T12:00:00Z", "cert_id": {"type": 1, "id": {"hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}}}
 # get names the check that refuses the metadata of Version 2
 get-refused	status	0x0
 get-refused	json	.responses | length == 1 and .[0].question.answer == "<ValueUnavailable: EFI variable EnhancedAuthRefused-8c78a505-baa0-4c4a-869f-000000000301 has enhanced authenticated access (attributes 0x87), whose metadata uefisettings refuses: EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1>"

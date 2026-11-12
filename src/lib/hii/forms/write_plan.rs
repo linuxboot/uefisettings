@@ -40,6 +40,7 @@ use super::ordered_list::ListRefusal;
 use super::ordered_list::ListWrite;
 use super::set::own_write;
 use super::set::ChangeValueError;
+use super::set::DriverStore;
 use super::set::NewValue;
 use super::set::VarStoreWrite;
 use super::storage::BufferExpression;
@@ -51,7 +52,7 @@ use super::time_storage::value_changes;
 use super::time_storage::FieldChange;
 use super::time_storage::TimeStorage;
 use super::time_storage::TimeWrite;
-use super::AccessLevel;
+use super::CheckedVarStores;
 use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
@@ -85,19 +86,20 @@ pub(super) struct QuestionWrites<'p> {
 impl<'a> WritePlan<'a> {
     /// The plan that sets `question` to `new_value` through variables of `reach` and
     /// `interface`, evaluating its WRITE expression with values read through `reader`, whose
-    /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL.
+    /// conditions read the VarStore bytes that `assumed` states in place of those their variables
+    /// hold.
     pub(super) fn new(
         question: &'a QuestionDescriptor,
         new_value: NewValue<'_>,
         (reach, interface): (VariableReach, VariableInterface),
         reader: &mut EfivarReader,
-        access_level: Option<AccessLevel>,
+        assumed: CheckedVarStores<'_>,
     ) -> Result<Self, ChangeValueError> {
         let (value, own) = own_write(question, new_value, reach, interface)?;
         let Some(this) = this_value(question.opcode, value) else {
             return Err(anyhow!("unsupported value type for {}", interface.write()).into());
         };
-        let values = VarStoreValues::new(&root_of(&question.node), access_level);
+        let values = VarStoreValues::new(&root_of(&question.node), assumed);
         let sets = evaluate_write(
             &question.node,
             this,
@@ -257,7 +259,7 @@ pub(super) fn list_own_write<'a>(
 
 /// The write of `write`, the CHAR16s of the STRING `question`, through variables of `reach`:
 /// refuses one with a WRITE expression, which takes its characters, or without a VarStore.
-fn string_own_write<'a>(
+pub(super) fn string_own_write<'a>(
     question: &'a QuestionDescriptor,
     StringWrite { offset, bytes }: StringWrite,
     reach: VariableReach,
@@ -397,34 +399,43 @@ impl BatchedWrite<'_> {
     }
 }
 
-/// A write of set's batch: of EFI Date/Time Storage for the question of a selector, or of a
-/// variable.
+/// A write of set's batch: of EFI Date/Time Storage for the question of a selector, of a
+/// variable, or of a driver that applies a value.
 pub(super) enum BatchedStore<'b, 'a> {
     Time {
         selector: &'a str,
         write: &'b TimeWrite,
     },
     Variable(&'b BatchedWrite<'a>),
+    Driver(&'b dyn DriverStore),
 }
 
 impl BatchedStore<'_, '_> {
-    /// The write as set's errors name it: its selectors and its storage or variable.
+    /// The write as set's errors name it: its selectors and its storage or variable, or its
+    /// driver's label.
     pub(super) fn label(&self) -> String {
         match self {
             Self::Time { selector, write } => format!("{selector} ({})", write.storage()),
             Self::Variable(batched) => batched.label(),
+            Self::Driver(driver) => driver.label(),
         }
     }
 
     /// Writes it, a variable through `variables`, and returns its label with the EFI_TIME that a
-    /// write of EFI Date/Time Storage wrote.
-    pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<String> {
+    /// write of EFI Date/Time Storage wrote, and a driver's annotation of set's answer.
+    pub(super) fn write(
+        &self,
+        variables: &dyn FirmwareVariables,
+    ) -> Result<(String, Option<String>)> {
         match self {
-            Self::Time { selector, write } => Ok(format!("{selector} ({})", write.write()?)),
+            Self::Time { selector, write } => {
+                Ok((format!("{selector} ({})", write.write()?), None))
+            }
             Self::Variable(batched) => {
                 batched.write.write(variables)?;
-                Ok(batched.label())
+                Ok((batched.label(), None))
             }
+            Self::Driver(driver) => Ok((driver.label(), Some(driver.apply()?))),
         }
     }
 }
@@ -841,10 +852,10 @@ mod tests {
     ) -> Result<Vec<bool>, String> {
         let through = (writes.reach(), writes.interface());
         let mut reader = EfivarReader::with_variables(Box::new(variables(through)));
-        let values = VarStoreValues::new(root, None);
+        let values = VarStoreValues::new(root, CheckedVarStores::NONE);
         let selection = find_question_in(
             root,
-            &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
+            &QuestionMatch::Prompt(&BTreeSet::from([prompt]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(strings, &[]),
                 &mut reader,
@@ -875,12 +886,13 @@ mod tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             volatile,
             pending,
             &WithholdingVariables::new(writes, WithheldBytes::default()),
+            &[],
         )
-        .map(|(written, _)| written.iter().map(|question| question.volatile).collect())
+        .map(|(written, _, _)| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"))
     }
 
@@ -1022,10 +1034,10 @@ mod tests {
             let mut reader = passwords
                 .reader(Box::new(variables(through)))
                 .expect("resolve the VarStore of the PASSWORD question");
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             let selection = find_question_in(
                 &root,
-                &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+                &QuestionMatch::Prompt(&BTreeSet::from(["Around"]), MatchTier::Stored),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&strings, &[]),
                     &mut reader,
@@ -1062,12 +1074,13 @@ mod tests {
                 },
                 IncludedStates::empty(),
                 &mut reader,
-                None,
+                CheckedVarStores::NONE,
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &passwords
                     .withholding(&writes)
                     .expect("resolve the VarStore of the PASSWORD question"),
+                &[],
             )
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
@@ -1152,10 +1165,10 @@ mod tests {
         let mut reader = passwords
             .reader(Box::new(variables(through)))
             .expect("resolve the VarStore of the PASSWORD question");
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let selection = find_question_in(
             &root,
-            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings, &[]),
                 &mut reader,
@@ -1180,12 +1193,13 @@ mod tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &passwords
                 .withholding(&writes)
                 .expect("resolve the VarStore of the PASSWORD question"),
+            &[],
         )
         .map(|_| ())
         .map_err(|error| format!("{error:#}"));
@@ -1301,10 +1315,10 @@ mod tests {
         strings: &[StringPackage],
         reader: &mut EfivarReader,
     ) -> QuestionDescriptor {
-        let values = VarStoreValues::new(root, None);
+        let values = VarStoreValues::new(root, CheckedVarStores::NONE);
         let selection = find_question_in(
             root,
-            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(strings, &[]),
                 reader,
@@ -1342,12 +1356,13 @@ mod tests {
             answer,
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &passwords
                 .withholding(&writes)
                 .expect("resolve the VarStore of the PASSWORD question"),
+            &[],
         )
         .map(|_| ())
         .map_err(|error| format!("{error:#}"));
@@ -1709,10 +1724,10 @@ mod tests {
         let mut reader = EfivarReader::with_variables(Box::new(variables(EFIVARFS)));
         let mut selections = Vec::new();
         for root in &roots {
-            let values = VarStoreValues::new(root, None);
+            let values = VarStoreValues::new(root, CheckedVarStores::NONE);
             selections.push(find_question_in(
                 root,
-                &QuestionMatch::Prompt(&BTreeSet::from(["Dup"])),
+                &QuestionMatch::Prompt(&BTreeSet::from(["Dup"]), MatchTier::Stored),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&strings, &[]),
                     &mut reader,
@@ -1743,10 +1758,11 @@ mod tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&writes, WithheldBytes::default()),
+            &[],
         )
         .expect("set both questions");
 

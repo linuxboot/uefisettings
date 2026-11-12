@@ -105,7 +105,8 @@ variable-storage-rt	status	aborted
 variable-storage-rt	json	. == {"error_message": "RUNTIME_ACCESS: runtime access implies boot service access (UEFI 2.10 section 8.2.3)"}
 # the help names no command or flag of the Linux build only
 help	status	0x0
-help	line	^Usage: uefisettings.efi \[OPTIONS\] <COMMAND>$
+help	line	^Usage: uefisettings.efi <COMMAND>$
+help	none	--hii-source|--efivar-memory
 help	none	^  (identify|ilo) 
 # get and set use the HII database here, with no backend to identify
 help	line	^  get +Get the current value of a question$
@@ -122,6 +123,12 @@ hii-set-help	line	--i-am-fine-to-brick-this-system
 # its long help lists set's unsafe operations, each check up to a space, where clap may wrap
 hii-set-help	line	(^| )browser,( |$)
 hii-set-help	line	(^| )EFI_IFR_FLAG_READ_ONLY( |$)
+# the flags of the Linux build's HiiDB source are unexpected arguments here, before or after
+# the command, as any unknown flag, not accepted and ignored
+hii-source-refused	status	aborted
+hii-source-refused	line	^error: unexpected argument '--hii-source' found$
+efivar-memory-refused	status	aborted
+efivar-memory-refused	line	^error: unexpected argument '--efivar-memory' found$
 # get and set by keyword through EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL (UEFI 2.11 §35.3.1):
 # DriverSample's "My Keyword Namespace Test" has the x-UEFI-ns keyword iSCSIBootEnable, the byte at
 # 0x5B, with the options 0, 1 and 3; PATH is the vendor device path of DriverSample's main form set

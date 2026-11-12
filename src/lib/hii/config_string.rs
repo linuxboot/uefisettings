@@ -24,6 +24,7 @@ use std::str::Split;
 
 use bitflags::bitflags;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::hex_digits::hex_byte;
 use crate::hex_digits::hex_bytes;
@@ -45,7 +46,7 @@ const MIN_DEVICE_PATH_LEN: usize = 4;
 
 // What a value or an element should have been, for ConfigStringError
 const GUID: &str = "<Guid>: 32 hex digits";
-const STRING: &str = "<String>: 4 hex digits per CHAR16";
+pub(crate) const STRING: &str = "<String>: 4 hex digits per CHAR16";
 const DEVICE_PATH: &str = "a device path: 2 hex digits per byte";
 const NUMBER: &str = "<Number>: hex digits";
 const SIZE_NUMBER: &str = "<Number>: hex digits of a value that fits usize";
@@ -292,6 +293,16 @@ impl ConfigRequest {
         }
         Ok(Self { header, elements })
     }
+
+    #[cfg(variable_data)]
+    pub(crate) fn header(&self) -> &ConfigHdr {
+        &self.header
+    }
+
+    #[cfg(variable_data)]
+    pub(crate) fn elements(&self) -> &[RequestElement] {
+        &self.elements
+    }
 }
 
 impl fmt::Display for ConfigRequest {
@@ -303,15 +314,17 @@ impl fmt::Display for ConfigRequest {
     }
 }
 
-/// `<BlockConfig>`: the bytes of a block of buffer storage, at most up to MAX_BLOCK_END.
+/// `<BlockConfig>`: the bytes of a block of buffer storage, at most up to MAX_BLOCK_END, which
+/// drop zeroes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockConfig {
     offset: usize,
-    value: Vec<u8>,
+    value: Zeroizing<Vec<u8>>,
 }
 
 impl BlockConfig {
     pub(crate) fn new(offset: usize, value: Vec<u8>) -> Result<Self, ConfigStringError> {
+        let value = Zeroizing::new(value);
         let width = NonZeroUsize::new(value.len()).ok_or(ConfigStringError::EmptyValue)?;
         check_block_end(offset, width)?;
         Ok(Self { offset, value })
@@ -362,16 +375,23 @@ impl BlockConfig {
         check_block_end(offset, width)?;
 
         let value_digits = elements.required_value("VALUE=")?;
-        let mut value =
-            hex_number(value_digits).ok_or_else(|| invalid_number("VALUE", value_digits))?;
-        let beyond_width = value.get(width.get()..);
+        let digits = Zeroizing::new(
+            hex_number(value_digits).ok_or_else(|| invalid_number("VALUE", value_digits))?,
+        );
+        let beyond_width = digits.get(width.get()..);
         if beyond_width.is_some_and(|bytes| bytes.iter().any(|byte| *byte != 0)) {
             return Err(ConfigStringError::ValueWiderThanWidth {
                 digits: value_digits.len(),
                 width: width.get(),
             });
         }
-        value.resize(width.get(), 0);
+        // a fresh buffer of the width, so that no reallocation leaves the bytes behind
+        let mut value = Zeroizing::new(vec![0; width.get()]);
+        // the digits past `width` are zero, as checked above
+        value
+            .iter_mut()
+            .zip(digits.iter())
+            .for_each(|(byte, digit)| *byte = *digit);
         Ok(Self { offset, value })
     }
 }
@@ -392,11 +412,12 @@ impl fmt::Display for BlockConfig {
 /// `<NvConfig>`: a setting of name/value storage. Its value is a `<String>` for a string question
 /// and a `<Number>` else, as EDK2's SetupBrowserDxe BufferToValue reads it; both are hex digits.
 /// It is empty for an empty string, as EDK2's DriverSample ExtractConfig and SetupBrowserDxe
-/// SetQuestionValue write it, although `<String>` has at least one `<Char>`.
+/// SetQuestionValue write it, although `<String>` has at least one `<Char>`. Drop zeroes the
+/// value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NvConfig {
     label: Label,
-    value: String,
+    value: Zeroizing<String>,
 }
 
 impl NvConfig {
@@ -406,7 +427,7 @@ impl NvConfig {
         }
         Ok(Self {
             label,
-            value: value.to_ascii_lowercase(),
+            value: Zeroizing::new(value.to_ascii_lowercase()),
         })
     }
 
@@ -424,11 +445,18 @@ impl NvConfig {
     pub(crate) fn number(&self) -> Option<Number> {
         hex_number(&self.value).map(Number)
     }
+
+    /// The value as a `<String>`'s CHAR16s, as edk2-stable202608 SetupBrowserDxe/Setup.c
+    /// BufferToValue reads that of a string question (:1564-1579): none if the digits are no
+    /// `<String>`, no CHAR16 if it is empty.
+    pub(crate) fn string(&self) -> Option<Vec<u16>> {
+        string_units(&self.value)
+    }
 }
 
 impl fmt::Display for NvConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}={}", self.label, self.value)
+        write!(f, "{}={}", self.label, *self.value)
     }
 }
 
@@ -1444,12 +1472,13 @@ fn parse_optional_number(
 
 /// The CHAR16s of a `<String>`, 4 hex digits each.
 fn parse_string(name: &str, digits: &str) -> Result<Vec<u16>, ConfigStringError> {
-    digits
-        .as_bytes()
-        .chunks(4)
-        .map(hex_unit)
-        .collect::<Option<_>>()
-        .ok_or_else(|| invalid_value(name, digits, STRING))
+    string_units(digits).ok_or_else(|| invalid_value(name, digits, STRING))
+}
+
+/// The CHAR16s of a `<String>`'s `digits`, 4 hex digits each, most significant first: none if
+/// they are no `<String>`.
+fn string_units(digits: &str) -> Option<Vec<u16>> {
+    digits.as_bytes().chunks(4).map(hex_unit).collect()
 }
 
 fn write_string(f: &mut fmt::Formatter<'_>, units: &[u16]) -> fmt::Result {
@@ -1829,6 +1858,23 @@ mod tests {
             Ok(text.clone()),
             "{text:?}"
         );
+    }
+
+    /// A setting reads as a string 4 hex digits per CHAR16, most significant first, a surrogate
+    /// too, and empty as no CHAR16; digits that no `<Char>`s fill read as none.
+    #[test]
+    fn nv_config_reads_its_digits_as_a_string() {
+        for (digits, want) in [
+            ("", Some(vec![])),
+            ("00410042", Some(vec![0x41, 0x42])),
+            ("00410042000000", None),
+            ("d8000041", Some(vec![0xD800, 0x41])),
+            ("004", None),
+            ("0041004", None),
+        ] {
+            let config = NvConfig::new(label("fred"), digits).expect("hex digits");
+            assert_eq!(config.string(), want, "{digits:?}");
+        }
     }
 
     #[test]

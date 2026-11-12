@@ -624,6 +624,11 @@ mod tests {
                 )),
             }
         }
+
+        /// set_mode deletes no variable, so this firmware refuses any deletion.
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            Err(anyhow!("deletion of EFI variable {key}: unexpected"))
+        }
     }
 
     /// What set_mode writes to `name` and tells of the write, as variable get prints it.

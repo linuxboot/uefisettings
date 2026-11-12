@@ -7,7 +7,8 @@
 #   boots        the boots, separated by ",", which share one UEFI variable store: each is a
 #                test binary of tests/qemu/guest/tests, then "/" and a libtest filter if any,
 #                or "shell:" and a script of tests/qemu/shell, which the firmware's UEFI Shell
-#                runs instead of Linux (check-shell-log.sh)
+#                runs instead of Linux (check-shell-log.sh), or "rebooting-shell:" and such a
+#                script, in a boot that a reset before the Shell restarts instead of ending
 #   options      key=value tokens separated by single spaces, each key at most once, which
 #                scenario-options.sh parses: kernel= how the scenario's Linux runs, "vamap" to
 #                have it call SetVirtualAddressMap(), which run.sh sets up per architecture, or
@@ -17,7 +18,8 @@
 #                that run.sh generates for the scenario, in User Mode, or "default"; arch= a
 #                comma list of the architectures that boot the scenario, of x86_64, i686 and
 #                aarch64, which the others skip; devices= a comma list of QEMU devices to add,
-#                of virtio-rng; guest= "unfixed" to boot the kernel of
+#                of virtio-rng and esp-disk, a writable disk that the boots share, partitioned
+#                as esp-disk.sfdisk; guest= "unfixed" to boot the kernel of
 #                guest-packages-<arch>-unfixed, or "unfixed-v5.8", with arch=x86_64, that of
 #                guest-packages-x86_64-unfixed-v5.8, both without upstream Linux 0e8d2444168d;
 #                params= a comma list of more kernel parameters of the Linux boots, such as
@@ -44,8 +46,12 @@ hii-outside-form-set-password	/publish-hiidb.efi rt-data-outside-form-set-passwo
 hii-first-store-password	/publish-hiidb.efi rt-data-first-store-password-forms	-	hii_first_store_password	arch=x86_64
 hii-name-value-password	/publish-hiidb.efi rt-data-name-value-password-forms	name-value-password.json	hii_name_value_password/without_snapshot::	-
 hii-name-value-password-snapshot	/publish-hiidb.efi export-config-name-value-password;/publish-hiidb.efi rt-data	name-value-password.json	hii_name_value_password/with_snapshot::	-
+hii-name-value-string	/publish-hiidb.efi rt-data-name-value-string-forms	-	hii_name_value_string/without_snapshot::	-
+hii-name-value-string-snapshot	/publish-hiidb.efi export-config-name-value-string;/publish-hiidb.efi rt-data	-	hii_name_value_string/with_snapshot::	-
 hii-storageless-password	/publish-hiidb.efi rt-data-storageless-password-forms	storageless-password.json	hii_storageless_password/without_snapshot::	-
 hii-storageless-password-snapshot	/publish-hiidb.efi export-config-storageless-password;/publish-hiidb.efi rt-data	storageless-password.json	hii_storageless_password/with_snapshot::	-
+hii-undeclared-password	/publish-hiidb.efi rt-data-undeclared-password-forms	undeclared-password.json	hii_undeclared_password/without_snapshot::	-
+hii-undeclared-password-snapshot	/publish-hiidb.efi export-config-undeclared-password;/publish-hiidb.efi rt-data	undeclared-password.json	hii_undeclared_password/with_snapshot::	-
 hii-time-storage	/DriverSample.efi;/publish-hiidb.efi wakeup-time-forms	my-ifr-nv-data.json	hii_time_storage	-
 hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-
 hii-acpi-hiid	/DriverSample.efi;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/hiid::	-
@@ -63,11 +69,16 @@ shell-formset-skip	/publish-hiidb.efi formset-skip-forms	formset-skip.json	shell
 shell-short-var-store	/publish-hiidb.efi short-var-store-forms	short-var-store.json	shell:short-var-store	-
 shell-outside-form-set-password	/publish-hiidb.efi outside-form-set-password-forms	-	shell:outside-form-set-password	-
 shell-disabled-form	/publish-hiidb.efi disabled-form-forms	disabled-form.json	shell:disabled-form	-
+hii-form-set-disable-if	/publish-hiidb.efi form-set-disable-if-forms;/publish-hiidb.efi rt-data	form-set-disable-if.json	hii_form_set_disable_if	-
+shell-form-set-disable-if	/publish-hiidb.efi form-set-disable-if-forms	form-set-disable-if.json	shell:form-set-disable-if	-
 shell-first-store-password	/publish-hiidb.efi first-store-password-forms	-	shell:first-store-password	-
 shell-keyword-kinds	/publish-hiidb.efi keyword-kinds-forms	-	shell:keyword-kinds	-
 shell-name-value-password	/publish-hiidb.efi name-value-password-forms	name-value-password.json	shell:name-value-password	-
 shell-storageless-password	/publish-hiidb.efi storageless-password-forms	storageless-password.json	shell:storageless-password	-
+shell-undeclared-password	/publish-hiidb.efi undeclared-password-forms	undeclared-password.json	shell:undeclared-password	-
 shell-time-storage	/DriverSample.efi;/publish-hiidb.efi wakeup-time-forms	my-ifr-nv-data.json	shell:time-storage	-
+shell-callback-forms	/publish-hiidb.efi callback-forms	-	shell:callback-forms	-
+shell-callback-forms-password	/publish-hiidb.efi callback-forms-password	-	shell:callback-forms-password	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 hii-auth87	/publish-hiidb.efi enhanced-auth-forms;/publish-hiidb.efi rt-data	enhanced-auth-87.json	hii_auth87	-
 shell-auth87	/publish-hiidb.efi enhanced-auth-forms	enhanced-auth-87.json	shell:auth87	-
@@ -102,6 +113,7 @@ shell-variable-get-secboot-user	-	-	shell:variable-get-secboot-user	firmware=sec
 variable-get-devdb	-	devdb.json	global_variables/get_devdb	-
 shell-variable-get-devdb	-	devdb.json	shell:variable-get-devdb	-
 global-variables	-	boot-options.json	global_variables/set_before_reboot,global_variables/after_reboot	-
+boot-manager	/DriverSample.efi	boot-manager.json	boot_manager/before_shell,shell:boot-manager,shell:boot-manager-next,boot_manager/after_shell	-
 shell-global-variables	-	-	shell:global-variables,shell:global-variables-reboot	-
 secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
 secboot-user	-	-	secboot/user_mode	firmware=secboot-user
@@ -145,4 +157,6 @@ shell-sign-user	-	-	shell:sign-user	firmware=secboot-user devices=virtio-rng
 shell-sign-no-rng	-	-	shell:sign-no-rng	firmware=secboot-user
 sign-setup	-	-	write_signed/signing_in_setup	firmware=secboot-setup
 shell-sign-setup	-	-	shell:sign-setup	firmware=secboot-setup devices=virtio-rng
+shell-auth3-checks	-	enhanced-auth-87.json	shell:auth3-checks	firmware=secboot-user devices=virtio-rng
 shell-devdb-setup	-	-	shell:devdb-setup,write_signed/devdb_appended_by_the_shell	firmware=secboot-setup devices=virtio-rng
+staged-set	/publish-hiidb.efi callback-forms;/publish-hiidb.efi rt-data	-	staged_set/stage_two_sets,rebooting-shell:staged-set-applied,staged_set/after_the_applied_boot,rebooting-shell:staged-set-not-started,staged_set/after_the_boot_without_its_image,rebooting-shell:staged-set-interrupted,staged_set/after_the_interrupted_boot	devices=esp-disk

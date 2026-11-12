@@ -54,6 +54,7 @@ use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::MatchTier;
 use crate::hii::variables::VariableLayout;
 
 /// EFI_IFR_UNIQUE_SET and EFI_IFR_NO_EMPTY_SET (UEFI 2.11 §33.3.8.3.53).
@@ -521,10 +522,12 @@ fn list_options(
                 // ONE_OF only, so no option of an ORDERED_LIST takes a snapshot value
                 source: ValueSource::Current,
                 value: texts.display(option.option_string_id).to_string(),
-                texts: texts
-                    .matching(option.option_string_id)
-                    .map(|(language, text)| (language.clone(), text.to_string()))
-                    .collect(),
+                texts: AnswerOption::texts_in(texts, option.option_string_id, MatchTier::Stored),
+                displayed_texts: AnswerOption::texts_in(
+                    texts,
+                    option.option_string_id,
+                    MatchTier::Displayed,
+                ),
                 state: option_state(&op, inputs),
             })
         })
@@ -615,6 +618,8 @@ pub(super) fn handle_ordered_list(
             .display(list.question_header().help_string_id)
             .to_string(),
         possible_options,
+        // StoragelessQuestion::refusal refuses one that its driver holds
+        driver_held: None,
         varstore,
         location: question.location(),
         input: TextInput::OrderedList(ListInput {
@@ -643,6 +648,7 @@ mod tests {
     use super::super::display;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::CheckedVarStores;
     use super::super::DefaultId;
     use super::super::EFI_IFR_TYPE_BOOLEAN;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
@@ -687,7 +693,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         .into_iter()
@@ -1009,7 +1015,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         .into_iter()
@@ -1036,6 +1042,7 @@ mod write_tests {
     use super::super::ifr_fixtures::*;
     use super::super::set::NewAnswer;
     use super::super::set_questions;
+    use super::super::CheckedVarStores;
     use super::super::IFROperation;
     use super::super::QuestionDescriptor;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
@@ -1116,12 +1123,13 @@ mod write_tests {
             answer,
             include,
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
+            &[],
         )
-        .map(|(written, _)| {
+        .map(|(written, _, _)| {
             let [written] = written.as_slice() else {
                 panic!("one question written");
             };

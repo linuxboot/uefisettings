@@ -233,16 +233,12 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
 
 #[cfg(variable_info)]
 impl<C: FirmwareEnvironmentCalls> VariableInfoSource for FirmwareEnvironment<C> {
-    /// The VariableInfo of `key`, from all of its data, which is dropped:
+    /// The VariableInfo of `key`, from all of its data, which is dropped but for its metadata:
     /// GetFirmwareEnvironmentVariableExW tells the size only as "the number of bytes stored in
     /// the pValue buffer" (Microsoft Learn, updated 2024-11-20).
     fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo> {
         let (attributes, data) = self.read_all(key)?;
-        Ok(VariableInfo {
-            variable: key.to_string(),
-            attributes,
-            size: data.len(),
-        })
+        Ok(VariableInfo::from_data(key, attributes, &data))
     }
 }
 
@@ -270,6 +266,22 @@ impl<C: FirmwareEnvironmentCalls> VariableData for FirmwareEnvironment<C> {
             .map_err(|code| {
                 anyhow!(
                     "SetFirmwareEnvironmentVariableExW of EFI variable {key} failed with {code}"
+                )
+            })
+    }
+
+    /// A zero-size SetFirmwareEnvironmentVariableExW of the variable's attributes, which
+    /// deletes it (Microsoft Learn, SetFirmwareEnvironmentVariableExW, updated 2024-11-20).
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        let (attributes, _) = self.read_all(key)?;
+        let name = variable_name(key)?;
+        let guid = variable_guid(key)?;
+        self.calls
+            .set_variable(&name, &guid, &[], attributes)
+            .map_err(|code| {
+                anyhow!(
+                    "SetFirmwareEnvironmentVariableExW deleting EFI variable {key} failed with \
+                     {code}"
                 )
             })
     }
@@ -959,6 +971,7 @@ mod tests {
                 variable: "Setup-00000000-0000-0000-0000-000000000000".to_string(),
                 attributes: NV_BS_RT,
                 size: 300,
+                metadata: None,
             }),
             "a variable of 300 bytes"
         );
@@ -974,6 +987,47 @@ mod tests {
             error.downcast_ref::<VariableNotFound>(),
             Some(&VariableNotFound(key)),
             "ERROR_ENVVAR_NOT_FOUND"
+        );
+    }
+
+    /// variable_info shows the EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable with
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 §8.2.1), but none of its data.
+    #[cfg(variable_info)]
+    #[test]
+    fn variable_info_shows_the_metadata_of_enhanced_authenticated_access() {
+        use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata_of;
+
+        let calls = FakeFirmwareEnvironmentCalls::new();
+        let data = [&nonce_metadata_of(&[7, 8, 9], &[0], 60)[..], b"value"].concat();
+        calls.queue_get(got(0x87, &data));
+        let environment = fake_environment(&calls);
+
+        let info = environment
+            .variable_info(&variable_key("Setup"))
+            .expect("info of a variable with metadata");
+
+        assert_eq!(
+            serde_json::to_value(&info).expect("serialize the info"),
+            serde_json::json!({
+                "variable": "Setup-00000000-0000-0000-0000-000000000000",
+                "attributes": 0x87,
+                "size": 65,
+                "metadata": {
+                    "version": 1,
+                    "type": 2,
+                    "metadata_size": 60,
+                    "flags": 0,
+                    "nonce": {"hex": "070809"},
+                    "cert_id": {
+                        "type": 1,
+                        "id": {
+                            "hex": "000102030405060708090a0b0c0d0e0f\
+                                    101112131415161718191a1b1c1d1e1f",
+                        },
+                    },
+                },
+            }),
+            "a nonce-type variable"
         );
     }
 

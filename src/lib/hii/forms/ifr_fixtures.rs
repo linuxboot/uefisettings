@@ -98,7 +98,7 @@ pub(crate) const DISABLE_IF: u8 = 0x1E;
 pub(super) const FORM: u8 = 0x01;
 pub(crate) const SUBTITLE: u8 = 0x02;
 pub(crate) const LOCKED: u8 = 0x0B;
-const ONE_OF_OPTION: u8 = 0x09;
+pub(super) const ONE_OF_OPTION: u8 = 0x09;
 const FORM_SET: u8 = 0x0E;
 const EQ_ID_VAL: u8 = 0x12;
 pub(super) const NOT: u8 = 0x17;
@@ -122,13 +122,7 @@ pub(crate) const VAR_STORE: u8 = 0x24;
 pub(crate) const VAR_STORE_NAME_VALUE: u8 = 0x25;
 pub(crate) const VAR_STORE_EFI: u8 = 0x26;
 pub(crate) const READ: u8 = 0x2D;
-pub(super) const WRITE: u8 = 0x2E;
-
-/// The Guid E770BB69-BCB4-4D04-9E97-23FF9456FEAC of AMI firmware's VarStore SystemAccess, as
-/// stored.
-pub(crate) const SYSTEM_ACCESS_GUID: [u8; 16] = [
-    0x69, 0xBB, 0x70, 0xE7, 0xB4, 0xBC, 0x04, 0x4D, 0x9E, 0x97, 0x23, 0xFF, 0x94, 0x56, 0xFE, 0xAC,
-];
+pub(crate) const WRITE: u8 = 0x2E;
 
 pub(crate) const GUID: u8 = 0x5F;
 
@@ -357,6 +351,7 @@ pub(crate) fn en_us_package(strings: StringMap) -> StringPackage {
     StringPackage {
         language: Language(b"en-US".to_vec()),
         strings,
+        replaced: Default::default(),
     }
 }
 
@@ -791,8 +786,19 @@ pub(crate) fn password_on(
     var_store_id: u16,
     offset: u16,
 ) -> Vec<u8> {
+    flagged_password_on(question_id, prompt, var_store_id, offset, 0x00)
+}
+
+/// password_on, with the question Flags `flags`: 0x04 is EFI_IFR_FLAG_CALLBACK.
+pub(crate) fn flagged_password_on(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+    flags: u8,
+) -> Vec<u8> {
     let data = [
-        question_header_on(question_id, prompt, var_store_id, offset),
+        question_header_with(question_id, prompt, var_store_id, offset, flags),
         [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
     ]
     .concat();
@@ -1033,7 +1039,11 @@ pub(super) fn question_descriptor(
     node: &Rc<RefCell<IFROperation>>,
     var_store: VarStoreFixture,
 ) -> QuestionDescriptor {
-    question_descriptor_with(node, var_store, &VarStoreValues::new(&root_of(node), None))
+    question_descriptor_with(
+        node,
+        var_store,
+        &VarStoreValues::new(&root_of(node), CheckedVarStores::NONE),
+    )
 }
 
 /// Returns the root of the tree of `node`.
@@ -1066,7 +1076,7 @@ pub(super) fn question_descriptor_timed(
     VarStoreFixture { store, efivars }: VarStoreFixture,
     time_services: Option<Rc<dyn TimeServices>>,
 ) -> QuestionDescriptor {
-    let values = VarStoreValues::new(&root_of(node), None);
+    let values = VarStoreValues::new(&root_of(node), CheckedVarStores::NONE);
     let mut reader = efivars.reader().with_time_services(time_services);
     describe(node, store, &values, &mut reader)
 }

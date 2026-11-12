@@ -27,7 +27,7 @@ use thiserror::Error;
 use super::conditions::enclosing_form_set;
 use super::conditions::option_state;
 use super::conditions::retrieve_question_value;
-use super::conditions::skips_scope;
+use super::conditions::skips_questions;
 use super::conditions::IncludedStates;
 use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
@@ -42,6 +42,7 @@ use super::defaults::option_value;
 use super::defaults::push_default;
 use super::defaults::question_defaults;
 use super::defaults::question_scope;
+use super::driver_held;
 use super::find_corresponding_varstore;
 use super::keywords::keyword_of;
 use super::keywords::KeywordStatement;
@@ -81,6 +82,7 @@ use crate::hii::config_string::Namespace;
 use crate::hii::package::Guid;
 use crate::hii::strings::is_configuration_language;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::MatchTier;
 
 /// A question whose value get reads and set writes.
 #[derive(Clone, Copy)]
@@ -380,12 +382,13 @@ pub(super) struct NamedQuestion {
 }
 
 /// Returns the ListedQuestions under `node`, in IFR order, whose prompt in a language of `texts`
-/// of no configuration language is one of `phrases`, ignoring ASCII case and surrounding
-/// whitespace, with those languages.
+/// of no configuration language, as `tier` takes it, is one of `phrases`, ignoring ASCII case and
+/// surrounding whitespace, with those languages.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     phrases: &BTreeSet<T>,
+    tier: MatchTier,
 ) -> Vec<NamedQuestion>
 where
     T: AsRef<str>,
@@ -393,7 +396,8 @@ where
     let mut found = Vec::new();
     visit_listed_questions(node, |node, form_set, header| {
         let languages: Vec<String> = texts
-            .matching(header.prompt_string_id)
+            .matching_in(header.prompt_string_id, tier)
+            .into_iter()
             .filter(|(_, prompt)| {
                 phrases
                     .iter()
@@ -423,7 +427,7 @@ fn visit_listed_questions(
 ) {
     walk_scopes(std::slice::from_ref(node), None, |node, &form_set| {
         let op = node.borrow();
-        if skips_scope(&op) {
+        if skips_questions(&op) {
             return Walk::Skip;
         }
         let form_set = match &op.parsed_data {
@@ -440,8 +444,9 @@ fn visit_listed_questions(
 
 /// What find_question selects questions by, in one FormSet.
 pub(crate) enum QuestionMatch<'a, T> {
-    /// The questions whose prompt is one of these phrases, as questions_named finds them
-    Prompt(&'a BTreeSet<T>),
+    /// The questions whose prompt, as the tier takes it, is one of these phrases, as
+    /// questions_named finds them
+    Prompt(&'a BTreeSet<T>, MatchTier),
     /// The question of this address
     Address(&'a QuestionAddress),
     /// The questions of these statements of a keyword, those of the FormSet
@@ -459,7 +464,7 @@ where
     T: AsRef<str>,
 {
     match *matching {
-        QuestionMatch::Prompt(phrases) => questions_named(node, texts, phrases)
+        QuestionMatch::Prompt(phrases, tier) => questions_named(node, texts, phrases, tier)
             .into_iter()
             .map(|named| named.node)
             .collect(),
@@ -644,15 +649,16 @@ pub enum QuestionSelector {
 }
 
 impl QuestionSelector {
-    /// What find_question selects by: by Prompt, any of `variations`, the spellings of its text;
-    /// by Keyword, `statements`, its statements in the HiiDB.
+    /// What find_question selects by: by Prompt, any of `variations`, the spellings of its text,
+    /// as `tier` takes the prompts; by Keyword, `statements`, its statements in the HiiDB.
     pub(crate) fn matching<'a, T>(
         &'a self,
         variations: &'a BTreeSet<T>,
+        tier: MatchTier,
         statements: &'a [KeywordStatement<'a>],
     ) -> QuestionMatch<'a, T> {
         match self {
-            Self::Prompt(_) => QuestionMatch::Prompt(variations),
+            Self::Prompt(_) => QuestionMatch::Prompt(variations, tier),
             Self::Address(address) => QuestionMatch::Address(address),
             Self::Keyword { .. } => QuestionMatch::Keyword(statements),
         }
@@ -833,7 +839,7 @@ pub(super) fn describe_question(
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let header = listed.header();
-    let prompt = walk.texts.display(header.prompt_string_id);
+    let prompt: &str = &walk.texts.display(header.prompt_string_id);
     let flags = header.flags() | class_question_flags(&question.borrow());
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
     match listed {
@@ -874,13 +880,13 @@ fn class_question_flags(question: &IFROperation) -> QuestionFlags {
 /// Returns `value`, a current value or IFR default of a CHECKBOX, as list-questions and get show
 /// it: FALSE or TRUE (UEFI 2.10 §33.3.8.3.9) as 0 or 1, any nonzero value as 1, as
 /// edk2-stable202608 ProcessOptions.c shows it on.
-fn checkbox_text(value: u64) -> String {
+pub(super) fn checkbox_text(value: u64) -> String {
     u8::from(value != 0).to_string()
 }
 
 /// Returns `value`, a current value or IFR default of a ONE_OF in `format`, as list-questions and
 /// get show it: `option`, the text of the option that holds it, else its number.
-fn one_of_text(value: u64, format: NumericFormat, option: Option<&str>) -> String {
+pub(super) fn one_of_text(value: u64, format: NumericFormat, option: Option<&str>) -> String {
     match option {
         Some(text) => text.to_string(),
         None => format!("{} (no matching option)", format.decode(value)),
@@ -926,6 +932,12 @@ pub(super) fn handle_checkbox(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        driver_held: driver_held::driver_held(
+            current_node,
+            &varstore,
+            ValueQuestion::CheckBox(parsed),
+            walk,
+        ),
         varstore,
         location: parsed.location,
         input: TextInput::Maximum(RangeType::NumSize8(1)),
@@ -990,11 +1002,12 @@ pub(super) fn handle_oneof(
                 raw_value,
                 source: ValueSource::since(taken, walk.inputs.reader),
                 value: walk.texts.display(o.option_string_id).to_string(),
-                texts: walk
-                    .texts
-                    .matching(o.option_string_id)
-                    .map(|(language, text)| (language.clone(), text.to_string()))
-                    .collect(),
+                texts: AnswerOption::texts_in(walk.texts, o.option_string_id, MatchTier::Stored),
+                displayed_texts: AnswerOption::texts_in(
+                    walk.texts,
+                    o.option_string_id,
+                    MatchTier::Displayed,
+                ),
                 state: option_state(&op, &mut walk.inputs),
             });
         }
@@ -1028,6 +1041,12 @@ pub(super) fn handle_oneof(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options,
+        driver_held: driver_held::driver_held(
+            current_node,
+            &varstore,
+            ValueQuestion::OneOf(parsed),
+            walk,
+        ),
         varstore,
         location: parsed.location,
         input: TextInput::Maximum(maximum(&parsed.data)),
@@ -1124,6 +1143,12 @@ pub(super) fn handle_numeric(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        driver_held: driver_held::driver_held(
+            current_node,
+            &varstore,
+            ValueQuestion::Numeric(parsed),
+            walk,
+        ),
         varstore,
         location: parsed.location,
         // set refuses bit fields, whose Flags from_ifr would misread
@@ -1196,6 +1221,8 @@ pub(super) fn handle_date_time(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        // StoragelessQuestion::refusal refuses one that its driver holds
+        driver_held: None,
         varstore,
         location: parsed.location(),
         input: TextInput::DateTime(DateTimeInput { format, stored }),
@@ -1223,6 +1250,7 @@ mod question_value_tests {
     use super::super::default_value_parser;
     use super::super::display_answer;
     use super::super::ifr_fixtures::*;
+    use super::super::CheckedVarStores;
     use super::super::DefaultId;
     use super::super::IfrDefaultValue;
     use super::super::Range16;
@@ -1387,7 +1415,7 @@ mod question_value_tests {
                 root,
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::all(),
-                None,
+                CheckedVarStores::NONE,
                 &mut efivars.reader(),
             );
             assert_eq!(questions.len(), listed, "{name}");
@@ -1460,7 +1488,7 @@ mod question_value_tests {
                 root,
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::all(),
-                None,
+                CheckedVarStores::NONE,
                 &mut disabled_reader(),
             );
             assert_eq!(questions.len(), 1, "{op_code:#04x}: the CHECKBOX");

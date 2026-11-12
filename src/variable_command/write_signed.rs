@@ -98,7 +98,7 @@ pub(super) struct WriteSignedArgs {
     /// With enhanced-authenticated-access, sign a NONCE_TYPE EFI_VARIABLE_AUTHENTICATION_3 of this nonce, two hex digits per byte, other than the variable's; all zero asks the firmware to make one of that size (UEFI 2.11 section 8.2.5)
     #[arg(long, requires = "data_file", conflicts_with = "timestamp")]
     nonce: Option<Nonce>,
-    /// The nonce that the variable holds, two hex digits per byte, which UEFI 2.11 section 8.2.5 signs after the data: required to update an existing NONCE_TYPE variable (deleting one, which section 8.2.3 defines, write-signed refuses), and omitted only to create one
+    /// The nonce that the variable holds, two hex digits per byte, which UEFI 2.11 section 8.2.5 signs after the data of an update of a NONCE_TYPE variable (deleting one, which section 8.2.3 defines, write-signed refuses): by default the one that the variable's metadata gives (section 8.2.1); given, it must be that one, and a create takes none
     // clap waives `requires` for an argument that conflicts with a given one, as --nonce with
     // --timestamp, hence the conflict.
     #[arg(long, requires = "nonce", conflicts_with = "timestamp")]
@@ -370,7 +370,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
                 | VariableSubcommands::Set { .. }
-                | VariableSubcommands::Storage { .. }) => {
+                | VariableSubcommands::Storage { .. }
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{argv:?} is no write-signed: {parsed:?}")
                 }
             },

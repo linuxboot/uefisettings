@@ -43,7 +43,10 @@ shift
 # PL011 UART, so the aarch64 guests write to a virtio console. Debian's i686 kernel has
 # efivarfs as a module. aarch64 runs under TCG, so it boots on x86_64 hosts like the others.
 # Fedora's kernel has that virtio console as a module. modules lists the modules of every guest
-# of the architecture, and guest_modules the one more module of a guest, if any.
+# of the architecture, guest_modules the one more module of a guest, if any, and
+# esp_disk_modules those of devices=esp-disk, each after those that it depends on: on i686,
+# virtio's PCI transport and block driver, FAT and NLS; on x86_64 and aarch64 only FAT, which
+# Fedora's kernel-modules-core ships, as kernel-core builds in the rest.
 # vamap_args, the QEMU arguments of the vamap scenarios, make the kernel call
 # SetVirtualAddressMap(), which x86 Linux does at every boot (Linux v6.11
 # arch/x86/platform/efi/efi.c efi_enter_virtual_mode()).
@@ -55,6 +58,7 @@ x86_64)
     firmware_vars=usr/share/OVMF/OVMF_VARS_4M.fd
     vmlinuz_pattern='lib/modules/*/vmlinuz'
     modules=()
+    esp_disk_modules=('lib/modules/*/kernel/fs/fat/fat.ko.xz' 'lib/modules/*/kernel/fs/fat/vfat.ko.xz')
     console=ttyS0
     tty=ttyS1
     tty_device=(-serial chardev:tty)
@@ -80,6 +84,18 @@ i686)
     firmware_vars=usr/share/OVMF/OVMF32_VARS_4M.fd
     vmlinuz_pattern='boot/vmlinuz-*'
     modules=('lib/modules/*/kernel/fs/efivarfs/efivarfs.ko')
+    esp_disk_modules=(
+        'lib/modules/*/kernel/drivers/virtio/virtio.ko'
+        'lib/modules/*/kernel/drivers/virtio/virtio_ring.ko'
+        'lib/modules/*/kernel/drivers/virtio/virtio_pci_legacy_dev.ko'
+        'lib/modules/*/kernel/drivers/virtio/virtio_pci_modern_dev.ko'
+        'lib/modules/*/kernel/drivers/virtio/virtio_pci.ko'
+        'lib/modules/*/kernel/drivers/block/virtio_blk.ko'
+        'lib/modules/*/kernel/fs/fat/fat.ko'
+        'lib/modules/*/kernel/fs/fat/vfat.ko'
+        'lib/modules/*/kernel/fs/nls/nls_cp437.ko'
+        'lib/modules/*/kernel/fs/nls/nls_ascii.ko'
+    )
     console=ttyS0
     tty=ttyS1
     tty_device=(-serial chardev:tty)
@@ -111,6 +127,7 @@ aarch64)
     vmlinuz_pattern='lib/modules/*/vmlinuz'
     modules=()
     guest_modules=([unfixed]='lib/modules/*/kernel/drivers/char/virtio_console.ko.xz')
+    esp_disk_modules=('lib/modules/*/kernel/fs/fat/fat.ko.xz' 'lib/modules/*/kernel/fs/fat/vfat.ko.xz')
     console=ttyAMA0
     tty=hvc0
     tty_device=(-device virtio-serial-pci -device "virtconsole,chardev=tty")
@@ -183,7 +200,7 @@ done
 # The test binaries that the Linux boots of the scenarios name, the fourth column.
 mapfile -t named < <(awk -F '\t' '$1 !~ /^(#|$)/ {
     n = split($4, boots, ",")
-    for (i = 1; i <= n; i++) if (boots[i] !~ /^shell:/) { sub("/.*", "", boots[i]); print boots[i] }
+    for (i = 1; i <= n; i++) if (boots[i] !~ /^(rebooting-)?shell:/) { sub("/.*", "", boots[i]); print boots[i] }
 }' "$here/scenarios.tsv")
 
 # One run of an architecture at a time, such as make -j's of its Linux and UEFI Shell
@@ -421,12 +438,22 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
     if [[ -n $option_guest && -n ${guest_modules[$option_guest]-} ]]; then
         patterns+=("${guest_modules[$option_guest]}")
     fi
-    # busybox insmod takes no compressed module.
+    # devices=esp-disk: Linux mounts that disk's ESP with these modules and stages on it the
+    # uefisettings.efi of the UEFI Shell boots, /uefisettings.efi in the initramfs.
+    if [[ " ${option_devices[*]} " == *" esp-disk "* ]]; then
+        patterns+=("${esp_disk_modules[@]}")
+        cp "$run/shell-esp/uefisettings.efi" "$dir/initramfs/"
+    fi
+    # busybox insmod takes no compressed module. init loads the modules in the order of their
+    # names, which number them in the order of patterns.
+    number=0
     for module in "${patterns[@]}"; do
+        number=$((number + 1))
         module=$(guest_file "$packages" "$module")
+        copy=$dir/initramfs/lib/modules/$(printf %02d "$number")-$(basename "$module" .xz)
         case $module in
-        *.ko.xz) xz --decompress --stdout "$module" >"$dir/initramfs/lib/modules/$(basename "$module" .xz)" ;;
-        *) cp "$module" "$dir/initramfs/lib/modules/" ;;
+        *.ko.xz) xz --decompress --stdout "$module" >"$copy" ;;
+        *) cp "$module" "$copy" ;;
         esac
     done
     cp "$packages/usr/bin/busybox" "$dir/initramfs/bin/busybox"
@@ -483,6 +510,13 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         case $device in
         # Its driver, VirtioRngDxe, gives the firmware EFI_RNG_PROTOCOL.
         virtio-rng) device_args+=(-device virtio-rng-pci) ;;
+        # A writable disk that the boots of the scenario share, after the read-only ESP of
+        # guest_args: /dev/vdb in Linux, which formats its EFI system partition.
+        esp-disk)
+            truncate --size=64M "$dir/esp-disk.img"
+            sfdisk --quiet "$dir/esp-disk.img" <"$here/esp-disk.sfdisk"
+            device_args+=(-drive "if=virtio,format=raw,file=$dir/esp-disk.img")
+            ;;
         esac
     done
     boot=0
@@ -491,15 +525,19 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         boot=$((boot + 1))
         log=$dir/boot$boot
         echo "run.sh: $name boot $boot: $spec"
+        # A reset ends QEMU, but in a rebooting-shell: boot, which a reset before its UEFI Shell
+        # restarts, such as the one that ends the boot of a staged set's Boot####.
+        reboot_args=(-no-reboot)
         case $spec in
-        shell:*)
+        shell:* | rebooting-shell:*)
             # Without a kernel, the firmware boots its UEFI Shell, which runs startup.nsh:
             # the boot's script, on a copy of the ESP that also holds uefisettings.efi, the
             # capsule payloads of shell/capsule in \capsule, and the kernel and initrd, which
             # the line @LINUX@ of the script starts from the shell, into the guest test
             # boot_smoke. The Secure Boot scenarios also get the pinned Shell, as the removable
             # media boot loader, their payloads in \auth and what uefisettings signs with in \sign.
-            script=$here/shell/${spec#shell:}
+            [[ $spec != rebooting-shell:* ]] || reboot_args=()
+            script=$here/shell/${spec#*shell:}
             esp=$log.esp
             cp -r "$run/esp" "$esp"
             if [[ $option_firmware != default ]]; then
@@ -543,7 +581,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         # (KVM_EXIT_SHUTDOWN) after its triple fault and 2 (I/O) after a reset through a port.
         # The console is the first serial port, before any of guest_args.
         : >"$log.qemu.log"
-        timeout --foreground -k 10 120 "${boot_qemu[@]}" -nodefaults -no-user-config -no-reboot \
+        timeout --foreground -k 10 120 "${boot_qemu[@]}" -nodefaults -no-user-config "${reboot_args[@]}" \
             -display none -sandbox on -m 1024 -smp 2 \
             -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
             -drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
@@ -560,7 +598,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         mv "$log.qemu.log.new" "$log.qemu.log"
         passed=yes
         case $spec in
-        shell:*)
+        shell:* | rebooting-shell:*)
             # shell/NAME.ARCH.tsv, if any, holds the checks of shell/NAME.nsh on ARCH instead
             expectations=$script.tsv
             [[ ! -f $script.$arch.tsv ]] || expectations=$script.$arch.tsv

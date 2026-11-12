@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::anyhow;
 use anyhow::Result;
 
+use super::DriverHeldValues;
 use super::HiiBackend;
 use crate::hii::package::db_file;
 use crate::hii::EfivarSource;
@@ -39,5 +40,15 @@ impl HiiBackend {
                  --efivars with a directory that dump-efivars wrote"
             )
         })
+    }
+}
+
+/// What get and set do with a question whose driver holds its value: no driver is reached here.
+impl HiiBackend {
+    pub(super) fn driver_held_values(
+        _hiidb: &[u8],
+        _efivars: &EfivarSource,
+    ) -> Option<Box<dyn DriverHeldValues>> {
+        None
     }
 }

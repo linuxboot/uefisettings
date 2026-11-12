@@ -29,7 +29,7 @@ use clap::Subcommand;
 use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
-use uefisettings::exports::AccessLevel;
+use uefisettings::exports::AssumedVarStore;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
@@ -63,10 +63,14 @@ use capsule_command::CapsuleCommand;
 use platform::EfivarArgs;
 use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
+use platform::HiiSourceArgs;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::HiiSourceUnsafeArgs;
 use platform::ListStringsHiiDbArgs;
+use platform::MachineHii;
 use platform::PlatformCommands;
+#[cfg(all(system_hiidb, system_variables))]
+use platform::StagingArgs;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::VolatileArgs;
 #[cfg(system_variables)]
@@ -102,40 +106,6 @@ struct UefiSettingsToolArgs {
     command: Commands,
     #[command(flatten)]
     hii_source: HiiSourceArgs,
-}
-
-/// Where the commands read this machine's HiiDB; global, so that the flags may also follow the
-/// command. Only the Linux build reads it in more than one way.
-#[derive(Debug, Default, Args)]
-struct HiiSourceArgs {
-    #[arg(long, global = true, value_enum, default_value_t, help = platform::HII_SOURCE_HELP)]
-    hii_source: HiiSourceArg,
-    #[arg(long, global = true, value_enum, default_value_t, help = platform::EFIVAR_MEMORY_HELP)]
-    efivar_memory: EfivarMemoryArg,
-}
-
-/// The values of --hii-source.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-enum HiiSourceArg {
-    /// acpi, then efivar, then systab: the next while a method finds its source absent or fails, none after a refusal (kernel lockdown, /dev/mem or /proc/kcore refused, or an unsafe operation without --i-am-fine-to-brick-this-system)
-    #[default]
-    Auto,
-    /// The memory that the OCP HiiDB variable points to, from /dev/mem
-    Efivar,
-    /// The vendor ACPI table QHII or HIID, from /sys/firmware/acpi/tables, without /dev/mem
-    Acpi,
-    /// The HII database export that the EFI System Table lists as a configuration table, from /dev/mem
-    Systab,
-}
-
-/// The values of --efivar-memory.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-enum EfivarMemoryArg {
-    /// One EFI runtime region of the firmware's memory map that is no memory-mapped I/O
-    #[default]
-    Runtime,
-    /// One firmware-reserved region of the firmware's memory map (x86: Reserved or ACPI Non-volatile Storage in /sys/firmware/memmap; aarch64: reserved, runtime services code or data, ACPI NVS or PAL code), never one that touches runtime memory-mapped I/O
-    FirmwareReserved,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +161,8 @@ enum Commands {
         unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
+        #[command(flatten)]
+        staging: StagingArgs,
     },
     /// Show the translation/spellings database for questions and answers
     #[command(next_display_order = None)]
@@ -254,6 +226,8 @@ enum HiiSubcommands {
         unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
+        #[command(flatten)]
+        staging: StagingArgs,
     },
     /// Show a human readable representation of the Hii Forms
     #[command(next_display_order = None)]
@@ -436,12 +410,15 @@ impl IncludeArgs {
 struct SelectionArgs {
     #[command(flatten)]
     include: IncludeArgs,
-    /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
-    /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
-    /// the stored value. This states a Setup privilege; it is no password and authenticates
-    /// nothing (UEFI variable writes carry no password).
-    #[arg(long, value_enum, value_name = "LEVEL")]
-    access_level: Option<AccessLevelArg>,
+    /// Evaluate conditions as if the VarStore whose efivar file is NAME-GUID held the bytes HEX,
+    /// two hex digits each, from byte OFFSET of its payload on (decimal, or hexadecimal after 0x;
+    /// default 0), whatever its variable holds; the reason of an unreadable value names
+    /// NAME-GUID+OFFSET. States, the options that conditions hide and the defaults they pick
+    /// follow these bytes; the questions on them still answer with what their variable holds,
+    /// and writes write the variable. This states what a setup browser holds; it is no password
+    /// and authenticates nothing (UEFI variable writes carry no password).
+    #[arg(long, value_name = "NAME-GUID[+OFFSET]=HEX")]
+    assume_var_store: Vec<AssumedVarStore>,
     #[command(flatten)]
     language: LanguageArgs,
 }
@@ -462,17 +439,13 @@ impl SelectionArgs {
     fn states(&self) -> IncludedStates {
         self.include.states()
     }
-
-    fn access_level(&self) -> Option<AccessLevel> {
-        self.access_level.map(AccessLevel::from)
-    }
 }
 
 impl From<&SelectionArgs> for GetOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
-        options.access_level = args.access_level();
+        options.assume_var_stores.clone_from(&args.assume_var_store);
         options.language.clone_from(&args.language.language);
         options
     }
@@ -483,7 +456,7 @@ impl From<&SelectionArgs> for SetOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
-        options.access_level = args.access_level();
+        options.assume_var_stores.clone_from(&args.assume_var_store);
         options.language.clone_from(&args.language.language);
         options
     }
@@ -493,7 +466,7 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
-        options.access_level = args.access_level();
+        options.assume_var_stores.clone_from(&args.assume_var_store);
         options.language.clone_from(&args.language.language);
         options
     }
@@ -518,6 +491,17 @@ const READ_ONLY_WRITE: &str = "a write of a question that EFI_IFR_FLAG_READ_ONLY
                                read-only (§33.3.8.3.88); of questions with the same text, set \
                                picks a writable one first among matches equally certain to be \
                                selected";
+
+/// What set refuses without --i-am-fine-to-brick-this-system on the builds that stage a set for
+/// the next boot.
+#[cfg(all(
+    system_hiidb,
+    system_variables,
+    any(target_os = "linux", target_os = "windows")
+))]
+const STAGED_SETUP_PASSWORD: &str = "a set staged for the next boot in a HiiDB that declares a \
+                                     setup password question, which the next boot applies before \
+                                     the OS, where no setup browser asks for or checks it";
 
 /// --i-am-fine-to-brick-this-system, which only the commands that have an unsafe operation take.
 #[cfg(system_variables)]
@@ -549,16 +533,19 @@ fn unsafe_long_help(arg: clap::Arg, operations: &[&str]) -> clap::Arg {
     ))
 }
 
-/// The SetOptions of `selection`, `unsafe_operations` and `volatile`.
+/// The SetOptions of `selection`, `unsafe_operations`, `volatile` and `staging`.
 #[cfg(all(system_hiidb, system_variables))]
 fn set_options(
     selection: &SelectionArgs,
     unsafe_operations: &UnsafeArgs,
     volatile: &VolatileArgs,
+    staging: &StagingArgs,
 ) -> SetOptions {
     let mut options = SetOptions::from(selection);
     options.unsafe_operations = unsafe_operations.operations();
     options.volatile = volatile.policy();
+    options.staging_image = staging.image();
+    options.staging_esp = staging.esp();
     options
 }
 
@@ -583,8 +570,9 @@ fn hii_set(
     options: &SetOptions,
     json: bool,
     source: &HiiSourceArgs,
+    hii: &impl MachineHii,
 ) -> Result<()> {
-    let (res, lifted) = platform::set_using(question, value, options, source)?;
+    let (res, lifted) = platform::set_using(question, value, options, source, hii)?;
     print_lifted(&lifted)?;
     print_with_style(res, json)?;
     Ok(())
@@ -620,21 +608,6 @@ impl From<IncludeState> for IncludedStates {
             IncludeState::GrayedOut => IncludedStates::GRAYED_OUT,
             IncludeState::Suppressed => IncludedStates::SUPPRESSED,
             IncludeState::Disabled => IncludedStates::DISABLED,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum AccessLevelArg {
-    Administrator,
-    User,
-}
-
-impl From<AccessLevelArg> for AccessLevel {
-    fn from(level: AccessLevelArg) -> Self {
-        match level {
-            AccessLevelArg::Administrator => AccessLevel::Administrator,
-            AccessLevelArg::User => AccessLevel::User,
         }
     }
 }
@@ -687,6 +660,11 @@ fn parse_error_exit_code(error: &clap::Error) -> ExitCode {
 }
 
 fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
+    handle_cmds_with(args, &platform::Firmware)
+}
+
+/// handle_cmds, with this machine's HII backend reached through `hii`.
+fn handle_cmds_with(args: UefiSettingsToolArgs, hii: &impl MachineHii) -> Result<()> {
     let source = &args.hii_source;
     match &args.command {
         Commands::Hii(hii_command) => match &hii_command.command {
@@ -702,7 +680,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 hii_get(
-                    &hiidb.read(&options.efivars, source)?,
+                    &hiidb.read(&options.efivars, source, hii)?,
                     question.selector()?,
                     &options,
                     output.json,
@@ -715,10 +693,11 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 selection,
                 unsafe_operations,
                 volatile,
+                staging,
             } => {
                 let (question, value) = target.target()?;
-                let options = set_options(selection, unsafe_operations, volatile);
-                hii_set(question, &value, &options, output.json, source)?
+                let options = set_options(selection, unsafe_operations, volatile, staging);
+                hii_set(question, &value, &options, output.json, source, hii)?
             }
             HiiSubcommands::ShowIFR {
                 hiidb,
@@ -731,13 +710,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let lines = HiiBackend::show_ifr_lines_using(
-                    &hiidb.read(&options.efivars, source)?,
+                    &hiidb.read(&options.efivars, source, hii)?,
                     &options,
                 )?;
                 print_terminal_lines(&lines)?;
             }
             HiiSubcommands::ListStrings { hiidb, output } => {
-                let res = HiiBackend::list_strings(&hiidb.read(&EfivarSource::Disabled, source)?)?;
+                let res =
+                    HiiBackend::list_strings(&hiidb.read(&EfivarSource::Disabled, source, hii)?)?;
                 print_with_style(res, output.json)?;
             }
             HiiSubcommands::ListQuestions {
@@ -751,7 +731,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let (res, ignored_ifr) = HiiBackend::list_questions_and_ignored_ifr_using(
-                    &hiidb.read(&options.efivars, source)?,
+                    &hiidb.read(&options.efivars, source, hii)?,
                     &options,
                 )?;
                 print_with_style(res, output.json)?;
@@ -760,7 +740,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     print_warning(format_args!("questions may be in {ignored}"))?;
                 }
             }
-            HiiSubcommands::Platform(command) => command.run(source)?,
+            HiiSubcommands::Platform(command) => command.run(source, hii)?,
         },
         #[cfg(all(system_hiidb, system_variables))]
         Commands::Get {
@@ -768,7 +748,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             output,
             selection,
             unsafe_operations,
-        } => platform::auto_get(question, output.json, selection, unsafe_operations, source)?,
+        } => platform::auto_get(
+            question,
+            output.json,
+            selection,
+            unsafe_operations,
+            source,
+            hii,
+        )?,
         #[cfg(all(system_hiidb, system_variables))]
         Commands::Set {
             target,
@@ -776,18 +763,34 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             selection,
             unsafe_operations,
             volatile,
+            staging,
         } => {
-            let options = set_options(selection, unsafe_operations, volatile);
-            platform::auto_set(target, output.json, selection, &options, source)?
+            let options = set_options(selection, unsafe_operations, volatile, staging);
+            platform::auto_set(
+                target,
+                output.json,
+                selection,
+                staging,
+                &options,
+                source,
+                hii,
+            )?
         }
         Commands::ShowTranslations { output } => {
+            source.refuse_given("show-translations reads none")?;
             print_with_style(&*translation_db, output.json)?;
         }
         #[cfg(system_variables)]
-        Commands::Variable(command) => command.run()?,
+        Commands::Variable(command) => {
+            source.refuse_given("variable reads none")?;
+            command.run()?
+        }
         #[cfg(system_variables)]
-        Commands::Capsule(command) => command.run()?,
-        Commands::Platform(command) => command.run(source)?,
+        Commands::Capsule(command) => {
+            source.refuse_given("capsule reads none")?;
+            command.run()?
+        }
+        Commands::Platform(command) => command.run(source, hii)?,
     }
     Ok(())
 }
@@ -880,6 +883,24 @@ fn write_warning(
 ) -> io::Result<()> {
     let warning = format!("warning: {}", TerminalText(&arguments.to_string()));
     write_lines(output, console, OutputSyntax::Text, &warning)
+}
+
+/// Prints `line` of what apply-staged did, which may name the HiiDB's strings, such as the prompt
+/// of a staged question, as TerminalText after `apply-staged: `.
+#[cfg(target_os = "uefi")]
+fn print_apply_staged_line(line: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    write_apply_staged_line(&mut stdout.lock(), &mut platform::stdout_output()?, line)
+}
+
+#[cfg(any(target_os = "uefi", test))]
+fn write_apply_staged_line(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    line: &str,
+) -> io::Result<()> {
+    let line = format!("apply-staged: {}", TerminalText(line));
+    write_lines(output, console, OutputSyntax::Text, &line)
 }
 
 /// Prints `value` as TerminalText, or as its JSON text, as JsonText, if `json`.
@@ -1117,49 +1138,113 @@ mod tests {
         }
     }
 
+    /// --assume-var-store, repeatable, gives get, set and list-questions its statements in order;
+    /// a value that is no NAME-GUID[+OFFSET]=HEX is refused before any command runs.
     #[test]
-    fn access_level_maps_to_its_flag() {
+    fn assume_var_store_maps_to_its_flag() {
+        const MODE: &str = "Mode-11111111-1111-1111-1111-111111111111";
         let cases = [
-            ("no flag", vec![], None),
+            ("no flag", vec![], vec![]),
             (
-                "administrator",
-                vec!["--access-level", "administrator"],
-                Some(AccessLevel::Administrator),
+                "one",
+                vec!["--assume-var-store".to_string(), format!("{MODE}=01")],
+                vec![format!("{MODE}+0=01")],
             ),
             (
-                "user",
-                vec!["--access-level", "user"],
-                Some(AccessLevel::User),
+                "two",
+                vec![
+                    "--assume-var-store".to_string(),
+                    format!("{MODE}+2=0a0b"),
+                    "--assume-var-store".to_string(),
+                    format!("{MODE}+0x10=ff"),
+                ],
+                vec![format!("{MODE}+2=0a0b"), format!("{MODE}+16=ff")],
             ),
         ];
-        for (name, args, level) in cases {
+        for (name, args, want) in cases {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let shown = |assumed: &[AssumedVarStore]| -> Vec<String> {
+                assumed.iter().map(ToString::to_string).collect()
+            };
             let selection = selection_of(&args);
             assert_eq!(
-                GetOptions::from(&selection).access_level,
-                level,
+                shown(&GetOptions::from(&selection).assume_var_stores),
+                want,
                 "{name}: get"
             );
             #[cfg(all(system_hiidb, system_variables))]
             assert_eq!(
-                SetOptions::from(&set_selection_of(&args)).access_level,
-                level,
+                shown(&SetOptions::from(&set_selection_of(&args)).assume_var_stores),
+                want,
                 "{name}: set"
             );
             assert_eq!(
-                ListQuestionsOptions::from(&selection).access_level,
-                level,
+                shown(&ListQuestionsOptions::from(&selection).assume_var_stores),
+                want,
                 "{name}: list-questions"
             );
         }
 
-        let error = hii(&[
-            &["list-questions"][..],
-            &OFFLINE_SOURCE,
-            &["--access-level", "0"],
-        ]
-        .concat())
-        .expect_err("parse --access-level 0");
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
+        for value in [MODE, &format!("{MODE}=0"), &format!("{MODE}+x=00")] {
+            let error = hii(&[
+                &["list-questions"][..],
+                &OFFLINE_SOURCE,
+                &["--assume-var-store", value],
+            ]
+            .concat())
+            .expect_err("parse --assume-var-store");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
+    }
+
+    /// --assume-var-store comes with --include: on hii get, set and list-questions and on get and
+    /// set, not on show-ifr, which evaluates no conditions, nor on ilo.
+    #[test]
+    fn assume_var_store_is_taken_where_include_is() {
+        let reading: [(&[&str], bool); 3] = [
+            (&["hii", "get", "Q"], true),
+            (&["hii", "list-questions"], true),
+            (&["hii", "show-ifr"], false),
+        ];
+        let reading = reading.map(|(command, takes)| ([command, &OFFLINE_SOURCE].concat(), takes));
+        let commands = reading
+            .iter()
+            .map(|(command, takes)| (&command[..], *takes));
+        #[cfg(all(system_hiidb, system_variables))]
+        let commands = commands.into_iter().chain([
+            (&["hii", "set", "Q", "V"][..], true),
+            (&["get", "Q"], true),
+            (&["set", "Q", "V"], true),
+        ]);
+        // the Linux build's own command
+        #[cfg(target_os = "linux")]
+        let commands = commands
+            .into_iter()
+            .chain([(&["ilo", "get", "Q"][..], false)]);
+        for (command, takes) in commands {
+            let argv = [
+                &["uefisettings"][..],
+                command,
+                &[
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
+                ],
+            ]
+            .concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            match takes {
+                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
+                false => assert_eq!(
+                    parsed.err(),
+                    Some(clap::error::ErrorKind::UnknownArgument),
+                    "{command:?}"
+                ),
+            }
+        }
     }
 
     /// No command's --include takes read-only: get and list-questions show read-only questions
@@ -1277,44 +1362,6 @@ mod tests {
                 }),
                 "{path:?}: {long_help:?}"
             );
-        }
-    }
-
-    /// --access-level comes with --include: on hii get, set and list-questions and on get and
-    /// set, not on show-ifr, which evaluates no conditions, nor on ilo.
-    #[test]
-    fn access_level_is_taken_where_include_is() {
-        let reading: [(&[&str], bool); 3] = [
-            (&["hii", "get", "Q"], true),
-            (&["hii", "list-questions"], true),
-            (&["hii", "show-ifr"], false),
-        ];
-        let reading = reading.map(|(command, takes)| ([command, &OFFLINE_SOURCE].concat(), takes));
-        let commands = reading
-            .iter()
-            .map(|(command, takes)| (&command[..], *takes));
-        #[cfg(all(system_hiidb, system_variables))]
-        let commands = commands.into_iter().chain([
-            (&["hii", "set", "Q", "V"][..], true),
-            (&["get", "Q"], true),
-            (&["set", "Q", "V"], true),
-        ]);
-        // the Linux build's own command
-        #[cfg(target_os = "linux")]
-        let commands = commands
-            .into_iter()
-            .chain([(&["ilo", "get", "Q"][..], false)]);
-        for (command, takes) in commands {
-            let argv = [&["uefisettings"][..], command, &["--access-level", "user"]].concat();
-            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
-            match takes {
-                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
-                false => assert_eq!(
-                    parsed.err(),
-                    Some(clap::error::ErrorKind::UnknownArgument),
-                    "{command:?}"
-                ),
-            }
         }
     }
 
@@ -1621,6 +1668,65 @@ mod tests {
                 clap::error::ErrorKind::UnknownArgument,
                 "{flags:?}"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn set_takes_the_image_that_it_stages() {
+        let image = "/boot/uefisettings.efi";
+        let cases: [(&[&str], Option<std::path::PathBuf>); 2] = [
+            (&["set", "Question", "Value"], None),
+            (
+                &["set", "Question", "Value", "--image", image],
+                Some(image.into()),
+            ),
+        ];
+        for (args, want) in cases {
+            let parsed = hii(args).unwrap_or_else(|error| panic!("parse {args:?}: {error}"));
+            let HiiSubcommands::Set {
+                selection,
+                unsafe_operations,
+                volatile,
+                staging,
+                ..
+            } = parsed
+            else {
+                panic!("{args:?} is no set: {parsed:?}");
+            };
+
+            let options = set_options(&selection, &unsafe_operations, &volatile, &staging);
+
+            assert_eq!(options.staging_image, want, "{args:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn set_on_windows_takes_the_mount_point_of_the_esp() {
+        let cases: [(&[&str], Option<std::path::PathBuf>); 2] = [
+            (&["set", "Question", "Value"], None),
+            (
+                &["set", "Question", "Value", "--esp", "S:"],
+                Some("S:".into()),
+            ),
+        ];
+        for (args, want) in cases {
+            let parsed = hii(args).unwrap_or_else(|error| panic!("parse {args:?}: {error}"));
+            let HiiSubcommands::Set {
+                selection,
+                unsafe_operations,
+                volatile,
+                staging,
+                ..
+            } = parsed
+            else {
+                panic!("{args:?} is no set: {parsed:?}");
+            };
+
+            let options = set_options(&selection, &unsafe_operations, &volatile, &staging);
+
+            assert_eq!(options.staging_esp, want, "{args:?}");
         }
     }
 
@@ -2164,57 +2270,32 @@ mod tests {
         assert!(is_broken_pipe(&error.into()));
     }
 
-    /// The flags of the HiiDB source default to auto and runtime, take each of their values, are
-    /// global, so that they also follow the command, and refuse another value, on every build.
+    /// --hii-source and --efivar-memory exist on the Linux build only, the one build that reads
+    /// this machine's HiiDB in more than one way: elsewhere clap refuses them as unexpected
+    /// arguments, before and after the command, so that no build accepts and ignores them.
     #[test]
-    fn hii_source_flags_default_and_follow_the_command() {
-        let parse = |args: &[&str]| {
-            let argv = [&["uefisettings"][..], args].concat();
-            let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
-                .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
-            (
-                parsed.hii_source.hii_source,
-                parsed.hii_source.efivar_memory,
-            )
+    fn hii_source_flags_exist_on_linux_only() {
+        let takes = false;
+        #[cfg(target_os = "linux")]
+        let takes = !takes;
+        let want = match takes {
+            true => Ok(()),
+            false => Err(clap::error::ErrorKind::UnknownArgument),
         };
-        assert_eq!(
-            parse(&["show-translations"]),
-            (HiiSourceArg::Auto, EfivarMemoryArg::Runtime),
-            "the defaults"
-        );
-        for (value, want) in [
-            ("auto", HiiSourceArg::Auto),
-            ("efivar", HiiSourceArg::Efivar),
-            ("acpi", HiiSourceArg::Acpi),
-            ("systab", HiiSourceArg::Systab),
+        for (flag, value) in [
+            ("--hii-source", "efivar"),
+            ("--efivar-memory", "firmware-reserved"),
         ] {
             for args in [
-                &["--hii-source", value, "show-translations"][..],
-                &["show-translations", "--hii-source", value],
+                &[flag, value, "show-translations"][..],
+                &["show-translations", flag, value],
             ] {
-                assert_eq!(parse(args).0, want, "{args:?}");
+                let argv = [&["uefisettings"][..], args].concat();
+                let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
+                    .map(drop)
+                    .map_err(|error| error.kind());
+                assert_eq!(parsed, want, "{argv:?}");
             }
-        }
-        for (value, want) in [
-            ("runtime", EfivarMemoryArg::Runtime),
-            ("firmware-reserved", EfivarMemoryArg::FirmwareReserved),
-        ] {
-            for args in [
-                &["--efivar-memory", value, "show-translations"][..],
-                &["show-translations", "--efivar-memory", value],
-            ] {
-                assert_eq!(parse(args).1, want, "{args:?}");
-            }
-        }
-        for flag in ["--hii-source", "--efivar-memory"] {
-            let error = UefiSettingsToolArgs::try_parse_from([
-                "uefisettings",
-                flag,
-                "hiidb",
-                "show-translations",
-            ])
-            .expect_err("an unknown value");
-            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "{flag}");
         }
     }
 
@@ -2263,6 +2344,106 @@ mod tests {
                 "{lines:?}: forged line"
             );
         }
+    }
+
+    /// get's answer and set's refusal of a question that its driver holds, which name the HiiDB's
+    /// strings, its prompt and what its driver did, such as the EFI variables that it changed,
+    /// print as every answer and error does: text as Debug, its control characters and
+    /// Bidi_Control characters escaped, JSON exact but for what JsonText spells, and through a
+    /// console that renders ASCII only, every other character escaped too.
+    #[test]
+    fn driver_held_answers_and_refusals_escape_firmware_texts() {
+        let prompt = "Q\u{1b}[2J\u{202e}\u{10d}";
+        let answer = uefisettings_backend_thrift::GetResponseList {
+            responses: vec![uefisettings_backend_thrift::GetResponse {
+                question: uefisettings_backend_thrift::Question {
+                    name: prompt.to_owned(),
+                    answer: "On <EFI variables changed: V\u{1b}-8c78a505-baa0-4c4a-869f-\
+                             000000000a01 (created)>"
+                        .to_owned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let refusal = uefisettings_backend_thrift::Error {
+            error_message: format!(
+                "cannot set question {prompt:?}: its driver's \
+                 CallBack(EFI_BROWSER_ACTION_CHANGING) refused the value: EFI_ACCESS_DENIED"
+            ),
+            ..Default::default()
+        };
+        let raw = ['\u{1b}', '\u{202e}', '\u{10d}'];
+        for json in [false, true] {
+            let mut ascii = Vec::new();
+            write_with_style(&mut ascii, &mut AsciiConsole, answer.clone(), json)
+                .expect("the answer through ASCII");
+            write_with_style(&mut ascii, &mut AsciiConsole, refusal.clone(), json)
+                .expect("the refusal through ASCII");
+            let ascii = String::from_utf8(ascii).expect("UTF-8");
+            assert!(
+                !ascii.contains(raw),
+                "json {json}, ASCII console: {ascii:?}"
+            );
+
+            let mut unicode = Vec::new();
+            write_with_style(&mut unicode, &mut UnicodeTerminal, answer.clone(), json)
+                .expect("the answer");
+            write_with_style(&mut unicode, &mut UnicodeTerminal, refusal.clone(), json)
+                .expect("the refusal");
+            let unicode = String::from_utf8(unicode).expect("UTF-8");
+            assert!(
+                !unicode.contains(['\u{1b}', '\u{202e}']),
+                "json {json}, UTF-8 terminal: {unicode:?}"
+            );
+            match json {
+                true => {
+                    let names: Vec<String> = unicode
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .filter_map(|value| {
+                            value["responses"][0]["question"]["name"]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .collect();
+                    assert_eq!(names, [prompt], "the prompt read back from the JSON");
+                }
+                false => assert!(
+                    unicode.contains("Q\\u{1b}[2J\\u{202e}\u{10d}"),
+                    "the prompt as Debug: {unicode:?}"
+                ),
+            }
+        }
+    }
+
+    /// A line of what apply-staged did, which names a staged question's prompt and its driver's
+    /// refusal, prints as TerminalText after `apply-staged: `, its line breaks escaped inside its
+    /// line, and through a console that renders ASCII only, every other character escaped too.
+    #[test]
+    fn apply_staged_lines_escape_firmware_texts() {
+        let line = "question \"Q\u{1b}[2J\u{202e}\u{10d}\": its driver refused\nthe value \\ \
+                    EFI_ACCESS_DENIED";
+        let mut unicode = Vec::new();
+        let mut ascii = Vec::new();
+
+        write_apply_staged_line(&mut unicode, &mut UnicodeTerminal, line).expect("write the line");
+        write_apply_staged_line(&mut ascii, &mut AsciiConsole, line)
+            .expect("write the line through ASCII");
+
+        assert_eq!(
+            String::from_utf8(unicode).expect("UTF-8"),
+            "apply-staged: question \"Q\\u{1b}[2J\\u{202e}\u{10d}\": its driver refused\\nthe \
+             value \\\\ EFI_ACCESS_DENIED\n",
+            "UTF-8 terminal"
+        );
+        assert_eq!(
+            String::from_utf8(ascii).expect("UTF-8"),
+            "apply-staged: question \"Q\\u{1b}[2J\\u{202e}\\u{10d}\": its driver refused\\nthe \
+             value \\\\ EFI_ACCESS_DENIED\n",
+            "ASCII console"
+        );
     }
 
     /// Text and JSON through a console that renders ASCII only: each other character escaped as

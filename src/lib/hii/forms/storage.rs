@@ -12,37 +12,58 @@
 
 //! The VarStores that IFR questions keep their values in, and the reads of those values from
 //! the EFI variables behind them.
+//!
+//! The stores that a FormSet declares (UEFI 2.11 §33.3.8.3.89-§33.3.8.3.91) and the settings
+//! that its questions request of each, as a forms browser builds a store's `<ConfigRequest>`
+//! (edk2-stable202608 SetupBrowserDxe IfrParse.c InitializeRequestElement), without the bytes or
+//! names of PASSWORD questions, which uefisettings never requests.
+
+use std::num::NonZeroUsize;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 use std::rc::Rc;
 
 use anyhow::Result;
 use binrw::BinRead;
 use thiserror::Error;
 
+use super::assumed_var_store::StoreStatements;
 use super::bit_field_bits;
 use super::conditions::question_expression;
 use super::conditions::question_value_expression;
+use super::conditions::skips_questions;
+use super::conditions::skips_scope;
 use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
 use super::conditions::MAX_READ_DEPTH;
+use super::defaults::question_scope;
 use super::ordered_list::ListRefusal;
 use super::question_values::value_question;
 use super::question_values::ListedQuestion;
+use super::refers_to_bit_field;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
 use super::string_question::NotUcs2;
 use super::time_storage::question_value;
 use super::time_storage::TimeStorageUnread;
+use super::walk_scopes;
 use super::IFROpCode;
 use super::IFROperation;
 use super::NumericFormatError;
+use super::ParsedOperation;
+use super::TypeValue;
+use super::Walk;
 use super::DECLARED_BOOT_SERVICE_ONLY;
 use super::EDKII_BIT_FIELD_VALUE_BITS;
+use super::EDKII_IFR_NUMERIC_SIZE_BIT;
+use super::EFI_IFR_NUMERIC_SIZE;
 use crate::hii::config_string::Number;
+use crate::hii::config_string::STRING;
 use crate::hii::package::Guid;
+use crate::hii::strings::ListTexts;
 use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarRange;
 use crate::hii::variables::EfivarReader;
@@ -56,6 +77,17 @@ use crate::hii::variables::VariableReach;
 use crate::hii::variables::VariableSizeMismatch;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use crate::hii::variables::EFI_VARIABLE_RUNTIME_ACCESS;
+
+/// EFI_QF_DATE_STORAGE, QF_TIME_STORAGE and their _NORMAL values (UEFI 2.11 §33.3.8.3.11,
+/// §33.3.8.3.78): only a DATE or TIME with normal storage has a VarStore setting.
+const QF_STORAGE: u8 = 0x30;
+const QF_STORAGE_NORMAL: u8 = 0x00;
+/// sizeof(EFI_HII_DATE), sizeof(EFI_HII_TIME), sizeof(EFI_HII_REF) (UEFI 2.11 §33.3.8.3.51)
+const DATE_WIDTH: usize = 4;
+const TIME_WIDTH: usize = 3;
+const REF_WIDTH: usize = 22;
+/// The size of EFI_IFR_QUESTION_HEADER, which every question op's data starts with
+const QUESTION_HEADER_SIZE: usize = 11;
 
 pub(super) trait VariableStore {
     fn name(&self) -> String;
@@ -167,19 +199,6 @@ pub(super) enum DeclaredBootServiceOnly {
 pub(super) enum VariableStoreKind {
     Buffer,
     EfiVariable,
-}
-
-/// The Name and Guid of a VarStore, which name its variable whatever its kind.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(super) struct VarStoreVariable {
-    pub(super) name: &'static str,
-    pub(super) guid: Guid,
-}
-
-impl VarStoreVariable {
-    pub(super) fn identifies(self, store: &dyn VariableStore) -> bool {
-        store.guid() == self.guid && store.name() == self.name
-    }
 }
 
 #[cfg(test)]
@@ -965,20 +984,33 @@ mod non_efi_varstore_tests {
                 "<ValueUnavailable: CHECKBOX value 256 over a byte>",
             ),
             (
-                ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::NotRead(
-                    EfivarsNotRead,
-                ))),
-                "<ValueUnavailable: EFI variables not read; the AMI setup browser keeps its \
-                 access level there (0 Administrator, 1 User); \
-                 --access-level administrator|user states one>",
+                ValueUnavailable::Unstated {
+                    reason: Box::new(ValueUnavailable::ReadError(
+                        "failed to read bytes: entity not found".into(),
+                    )),
+                    key: variable_key("Setup"),
+                    bytes: vec![Range { start: 2, end: 4 }],
+                },
+                "<VStoreError: failed to read bytes: entity not found; --assume-var-store \
+                 Setup-00000000-0000-0000-0000-000000000000+2=<HEX of 2 bytes> states it>",
             ),
             (
-                ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::ReadError(
-                    "failed to read bytes: entity not found".into(),
-                ))),
-                "<VStoreError: failed to read bytes: entity not found; the AMI setup browser \
-                 keeps its access level there (0 Administrator, 1 User); \
-                 --access-level administrator|user states one>",
+                ValueUnavailable::Unstated {
+                    reason: Box::new(ValueUnavailable::PartlyStated {
+                        reason: Box::new(ValueUnavailable::Truncated { offset: 0, len: 6 }),
+                        key: variable_key("a/b"),
+                        stated: vec![1..2, 3..4],
+                        unstated: vec![0..1, 2..3, 4..5],
+                    }),
+                    key: variable_key("a/b"),
+                    bytes: vec![0..1, 2..3, 4..5],
+                },
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: 0; buflen: 6); bytes \
+                 1..2, 3..4 of a!b-00000000-0000-0000-0000-000000000000 stated, 0..1, 2..3, 4..5 \
+                 not; --assume-var-store a!b-00000000-0000-0000-0000-000000000000+0=<HEX of 1 \
+                 byte>, --assume-var-store a!b-00000000-0000-0000-0000-000000000000+2=<HEX of 1 \
+                 byte> and --assume-var-store a!b-00000000-0000-0000-0000-000000000000+4=<HEX of \
+                 1 byte> state them>",
             ),
         ];
         for (reason, want) in cases {
@@ -1082,6 +1114,7 @@ mod non_efi_varstore_tests {
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],
+                displayed_texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],
                 value_type: super::super::EFI_IFR_TYPE_NUM_SIZE_8,
                 raw_value: Ok(TypeValue::NumSize8(1)),
                 source: ValueSource::Current,
@@ -1103,6 +1136,7 @@ mod non_efi_varstore_tests {
                 parsed_data: ParsedOperation::Placeholder,
                 header_past_length: Vec::new(),
             })),
+            driver_held: None,
         };
 
         let variables = test_var_store_variables();
@@ -1277,19 +1311,38 @@ pub(super) enum ValueUnavailable {
     /// The CHAR16s of a STRING, one of which no UCS-2 character is
     #[error("{0}")]
     StoredString(NotUcs2),
-    /// A STRING of a VARSTORE_NAME_VALUE, whose setting ConfigSnapshot keeps as a number only
+    /// The setting of a STRING of a VARSTORE_NAME_VALUE in the ExportConfig snapshot, whose
+    /// digits are no `<String>` (UEFI 2.11 §35.2.1.2)
+    #[error("its setting in the ExportConfig snapshot is no {}", STRING)]
+    SnapshotStringDigits,
+    /// The setting of a STRING of a VARSTORE_NAME_VALUE in the ExportConfig snapshot, which holds
+    /// characters other than NULL past the question's MaxSize
     #[error(
-        "uefisettings keeps the ExportConfig snapshot's settings of a VARSTORE_NAME_VALUE as \
-         numbers only, so it takes no string from them"
+        "its setting in the ExportConfig snapshot holds more than its MaxSize of {max_size} \
+         characters"
     )]
-    NameValueString,
-    /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
-    /// level replaces it only in conditions
+    SnapshotStringLength { max_size: usize },
+    /// A value of which --assume-var-store states the bytes `stated` of the variable `key` but
+    /// not `unstated`, which `reason` keeps from being read
     #[error(
-        "{0}; the AMI setup browser keeps its access level there (0 Administrator, 1 User); \
-         --access-level administrator|user states one"
+        "{reason}; bytes {} of {key} stated, {} not",
+        byte_ranges(.stated),
+        byte_ranges(.unstated)
     )]
-    AmiAccessLevel(Box<ValueUnavailable>),
+    PartlyStated {
+        reason: Box<ValueUnavailable>,
+        key: VariableKey,
+        stated: Vec<Range<usize>>,
+        unstated: Vec<Range<usize>>,
+    },
+    /// Why a condition cannot read the `bytes` of the variable `key`, which --assume-var-store
+    /// states in place of them; answers keep `reason`, since stated bytes reach only conditions
+    #[error("{reason}{}", stating(.key, .bytes))]
+    Unstated {
+        reason: Box<ValueUnavailable>,
+        key: VariableKey,
+        bytes: Vec<Range<usize>>,
+    },
 }
 
 impl ValueUnavailable {
@@ -1314,6 +1367,44 @@ impl ValueUnavailable {
         }
     }
 
+    /// The bytes of a value at `location` that --assume-var-store would state in place of those
+    /// its variable cannot give, as this says: those that a PartlyStated value lacks, else the
+    /// location's; None where its variable is not why it has no value. PasswordBytes is None:
+    /// stating them would put a password on a command line.
+    pub(super) fn stateable_bytes(&self, location: ValueLocation) -> Option<Vec<Range<usize>>> {
+        match self {
+            Self::PartlyStated {
+                reason, unstated, ..
+            } => reason.stateable_bytes(location).map(|_| unstated.clone()),
+            Self::DeclaredBootServiceOnly(_)
+            | Self::EnhancedAuthenticated(_)
+            | Self::NotRead(_)
+            | Self::Missing(_)
+            | Self::Size(_)
+            | Self::MissingBuffer(_)
+            | Self::ReadError(_)
+            | Self::Truncated { .. } => Some(vec![location.bytes()]),
+            Self::NoVarStore(_)
+            | Self::Storageless(_)
+            | Self::Expression(_)
+            | Self::ReadCycle(_)
+            | Self::ReadDepth(_)
+            | Self::ValueExpression(_)
+            | Self::PasswordBytes
+            | Self::BitField(_)
+            | Self::NotDecoded(_)
+            | Self::CheckboxOverByte(_)
+            | Self::SnapshotNumber { .. }
+            | Self::TimeStorageUnread(_)
+            | Self::TimeService(_)
+            | Self::BufferExpression(_)
+            | Self::StoredString(_)
+            | Self::SnapshotStringDigits
+            | Self::SnapshotStringLength { .. }
+            | Self::Unstated { .. } => None,
+        }
+    }
+
     /// The text that get, list-questions and show-ifr show for the value: the reason, tagged
     /// VStoreError for a read error, ExtractEFIDataError for a short variable, else
     /// ValueUnavailable.
@@ -1321,12 +1412,12 @@ impl ValueUnavailable {
         format!("<{}: {self}>", self.tag())
     }
 
-    /// to_answer's tag: AmiAccessLevel keeps the tag of its reason.
+    /// to_answer's tag: PartlyStated and Unstated keep the tag of their reason.
     fn tag(&self) -> &'static str {
         match self {
             Self::ReadError(_) => "VStoreError",
             Self::Truncated { .. } => "ExtractEFIDataError",
-            Self::AmiAccessLevel(reason) => reason.tag(),
+            Self::PartlyStated { reason, .. } | Self::Unstated { reason, .. } => reason.tag(),
             Self::NoVarStore(_)
             | Self::Storageless(_)
             | Self::Expression(_)
@@ -1348,7 +1439,8 @@ impl ValueUnavailable {
             | Self::TimeService(_)
             | Self::BufferExpression(_)
             | Self::StoredString(_)
-            | Self::NameValueString => "ValueUnavailable",
+            | Self::SnapshotStringDigits
+            | Self::SnapshotStringLength { .. } => "ValueUnavailable",
         }
     }
 }
@@ -1399,7 +1491,7 @@ pub(super) enum ValueLocation {
 
 impl ValueLocation {
     /// The payload bytes that hold the value: for Bits, the StorageWidth bytes of IfrParse.c.
-    fn bytes(self) -> std::ops::Range<usize> {
+    pub(super) fn bytes(self) -> Range<usize> {
         match self {
             Self::Bytes { offset, size } => {
                 usize::from(offset)..usize::from(offset) + usize::from(size)
@@ -1564,6 +1656,113 @@ pub(super) fn read_question_value(
     })
 }
 
+/// read_question_value, with the bytes of `stated`, statements of `varstore`, in place of those
+/// its variable holds: a value of EFI Date/Time Storage reads none of them. Where they state only
+/// some bytes of the value, the others come from read_sourced_bytes, and if it fails, the value
+/// is PartlyStated.
+pub(super) fn read_stated_question_value(
+    question: &IFROperation,
+    varstore: &Result<Box<dyn VariableStore>>,
+    stated: &StoreStatements<'_>,
+    reader: &mut EfivarReader,
+) -> std::result::Result<RetrievedValue, ValueUnavailable> {
+    let Some(value_question) = value_question(question) else {
+        return Err(ValueUnavailable::NotDecoded(question.op_code));
+    };
+    let location = value_question
+        .location()
+        .check()
+        .map_err(ValueUnavailable::BitField)?;
+    let range = location.0.bytes();
+    let patch = stated.bytes(range.clone());
+    let (Ok(store), None) = (varstore, value_question.time_storage()) else {
+        return read_question_value(question, varstore, reader);
+    };
+    if patch.iter().all(Option::is_none) {
+        return read_question_value(question, varstore, reader);
+    }
+    let (bytes, source) = match patch.iter().copied().collect::<Option<Vec<u8>>>() {
+        Some(bytes) => (bytes, ValueSource::Current),
+        None => {
+            let (read, source) =
+                read_sourced_bytes(question, varstore, reader).map_err(|reason| {
+                    let (stated, unstated) = stated_ranges(&patch, range.start);
+                    ValueUnavailable::PartlyStated {
+                        reason: Box::new(reason),
+                        key: store.variable_key(),
+                        stated,
+                        unstated,
+                    }
+                })?;
+            let bytes = patch
+                .iter()
+                .zip(read)
+                .map(|(stated, read)| stated.unwrap_or(read))
+                .collect();
+            (bytes, source)
+        }
+    };
+    Ok(RetrievedValue {
+        location,
+        value: location.read(&bytes),
+        source,
+    })
+}
+
+/// The ranges of payload bytes that `patch`, the stated bytes from byte `start` on, states, and
+/// those it does not.
+pub(super) fn stated_ranges(
+    patch: &[Option<u8>],
+    start: usize,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let mut stated: Vec<Range<usize>> = Vec::new();
+    let mut unstated: Vec<Range<usize>> = Vec::new();
+    for (at, byte) in (start..).zip(patch) {
+        let ranges = match byte {
+            Some(_) => &mut stated,
+            None => &mut unstated,
+        };
+        match ranges.last_mut() {
+            Some(last) if last.end == at => last.end = at + 1,
+            Some(_) | None => ranges.push(at..at + 1),
+        }
+    }
+    (stated, unstated)
+}
+
+/// "; " and the --assume-var-store of each of `ranges` of the variable `key`, which states the
+/// bytes there; nothing for no range.
+fn stating(key: &VariableKey, ranges: &[Range<usize>]) -> String {
+    let flags: Vec<String> = ranges
+        .iter()
+        .map(|range| {
+            let unit = match range.len() {
+                1 => "byte",
+                _ => "bytes",
+            };
+            format!(
+                "--assume-var-store {key}+{}=<HEX of {} {unit}>",
+                range.start,
+                range.len()
+            )
+        })
+        .collect();
+    match flags.as_slice() {
+        [flag] => format!("; {flag} states it"),
+        [first @ .., last] => format!("; {} and {last} state them", first.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// `ranges` of payload bytes as A..B, in order, separated by ", ".
+pub(super) fn byte_ranges(ranges: &[Range<usize>]) -> String {
+    ranges
+        .iter()
+        .map(|range| format!("{}..{}", range.start, range.end))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Returns the value_bytes of the question and where they come from, or why they cannot be read:
 /// from the ExportConfig snapshot of `reader`, if any, where the question's variable is missing
 /// or its storage is name/value (snapshot_bytes).
@@ -1622,16 +1821,23 @@ fn snapshot_bytes(
             let Some(NameValueStore { guid }) = error.downcast_ref() else {
                 return Err(unread);
             };
-            let number = snapshot
-                .number(*guid, question.header().var_store_info)
-                .ok_or(unread)?;
+            let Some(setting) = snapshot.setting(*guid, question.header().var_store_info) else {
+                return Err(unread);
+            };
             match question {
-                ListedQuestion::String(_) => return Err(ValueUnavailable::NameValueString),
+                ListedQuestion::String(_) => {
+                    let units = setting
+                        .string()
+                        .ok_or(ValueUnavailable::SnapshotStringDigits)?;
+                    string_bytes(&units, value.len())
+                }
                 ListedQuestion::Value(_)
                 | ListedQuestion::OrderedList(_)
-                | ListedQuestion::Ref(_) => {}
+                | ListedQuestion::Ref(_) => match setting.number() {
+                    Some(number) => number_bytes(&number, value.len()),
+                    None => Err(unread),
+                },
             }
-            number_bytes(number, value.len())
         }
     }
 }
@@ -1647,6 +1853,24 @@ fn number_bytes(number: &Number, size: usize) -> std::result::Result<Vec<u8>, Va
         });
     }
     let mut bytes = bytes.to_vec();
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+/// The `size` bytes of the STRING whose CHAR16s are `units`, NULL-padded, as EDK2's
+/// SetupBrowserDxe BufferToValue takes them (edk2-stable202608 Setup.c:1557-1579), or why they
+/// cannot hold them: where it drops the CHAR16s past MaxSize, `size` / 2, this refuses those that
+/// are not NULL.
+fn string_bytes(units: &[u16], size: usize) -> std::result::Result<Vec<u8>, ValueUnavailable> {
+    let max_size = size / 2;
+    if units.iter().skip(max_size).any(|unit| *unit != 0) {
+        return Err(ValueUnavailable::SnapshotStringLength { max_size });
+    }
+    let mut bytes: Vec<u8> = units
+        .iter()
+        .take(max_size)
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
     bytes.resize(size, 0);
     Ok(bytes)
 }
@@ -1728,6 +1952,7 @@ mod efivar_reader_tests {
     use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::CheckedVarStores;
     use super::super::EFI_IFR_NUMERIC_SIZE_2;
     use super::super::EFI_IFR_NUMERIC_SIZE_4;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
@@ -1946,7 +2171,7 @@ mod efivar_reader_tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut disabled_reader(),
         )
         .into_iter()
@@ -1979,7 +2204,7 @@ mod efivar_reader_tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::CONDITIONS,
-            None,
+            CheckedVarStores::NONE,
             reader,
         )
         .into_iter()
@@ -1991,7 +2216,8 @@ mod efivar_reader_tests {
     fn disabled_source_leaves_value_conditions_undetermined() {
         let efivars = Efivars::new();
         let undetermined = " <selectable or suppressed: EFI_IFR_EQ_ID_VAL of question 0x0002: \
-            <ValueUnavailable: EFI variables not read>>";
+            <ValueUnavailable: EFI variables not read; --assume-var-store \
+            Setup-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>>";
 
         efivars.write(&efi_variable("Setup", 2), &[1, 0]);
         assert_eq!(
@@ -2039,7 +2265,7 @@ mod efivar_reader_tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut reader,
         )
         .into_iter()
@@ -2206,7 +2432,7 @@ mod efivar_reader_tests {
                     Rc::clone(&root),
                     &ListTexts::new(&strings(), &[]),
                     IncludedStates::empty(),
-                    None,
+                    CheckedVarStores::NONE,
                     &mut reader,
                 )
                 .into_iter()
@@ -2582,4 +2808,665 @@ pub(super) enum ShortEfiReason {
     /// gives no StorageWidth (:2466-2493)
     #[error("{}", ListRefusal::NoOptions)]
     NoOptions,
+}
+
+/// A store as a FormSet's IFR declares it, with the settings of its questions that a forms
+/// browser requests, but those of PASSWORD questions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreDeclaration {
+    /// Its VarStoreId
+    pub(crate) id: u16,
+    pub(crate) guid: Guid,
+    pub(crate) kind: DeclaredKind,
+    /// Whether a PASSWORD question names it: its bytes are never requested, and a RouteConfig()
+    /// without them may clear them
+    pub(crate) holds_password: bool,
+}
+
+/// The kind of a StoreDeclaration, with what a forms browser requests of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclaredKind {
+    /// EFI_IFR_VARSTORE `name`: `width` bytes at VarOffset `offset` per question, without any
+    /// block that overlaps a PASSWORD question's bytes
+    Buffer {
+        name: String,
+        blocks: Vec<(u16, NonZeroUsize)>,
+    },
+    /// EFI_IFR_VARSTORE_NAME_VALUE: the VarName of each question but a PASSWORD question's
+    NameValue { names: Vec<String> },
+    /// EFI_IFR_VARSTORE_EFI `name`: the EFI variable of that name and the store's GUID; of an
+    /// EFI_IFR_VARSTORE_EFI before UEFI 2.3.1, the EFI variable that a VarName names
+    EfiVariable { name: String },
+}
+
+/// The stores that `form_set` declares, in IFR order, each with the settings that the questions
+/// of its forms request of it, without repeats, as a forms browser adds them to the store's
+/// `<ConfigRequest>` (only questions in a form reach InitializeRequestElement): a Buffer store's
+/// by VarOffset and width, a Name/Value store's by VarName, its text in `texts`, as
+/// edk2-stable202608 SetupBrowserDxe IfrParse.c takes a VarName through GetToken. A PASSWORD
+/// question's bytes or name are withheld: no setting that covers them is requested, and its store
+/// holds a password. In place of a VARSTORE_EFI before UEFI 2.3.1, each EFI variable that the
+/// VarName of one of its questions names (ShortVarStoreEfi::candidate_variables), once, which
+/// holds a password if a PASSWORD question names it. It leaves out what IfrParse.c ParseOpCodes
+/// skips with a DISABLE_IF outside forms (skips_questions): the VarStore ops there, whose stores
+/// it never creates, and the settings of the questions there, but the bytes of a PASSWORD there
+/// stay withheld. What ParseOpCodes may skip counts as parsed.
+pub(crate) fn store_declarations(
+    form_set: &IFROperation,
+    texts: &ListTexts<'_>,
+) -> Vec<StoreDeclaration> {
+    /// A VarStore op: its store, or a VARSTORE_EFI before UEFI 2.3.1, whose questions' VarNames
+    /// name the EFI variables
+    enum Declared {
+        Store(StoreDeclaration),
+        ShortEfi(ShortVarStoreEfi),
+    }
+
+    /// Where an op is: in a form, and in the scope of a DISABLE_IF that skips_questions names
+    #[derive(Clone, Copy)]
+    struct Place {
+        in_form: bool,
+        skipped: bool,
+    }
+
+    let mut declared = Vec::new();
+    let mut storages = Vec::new();
+    let root = Place {
+        in_form: false,
+        skipped: false,
+    };
+    walk_scopes(&form_set.children, root, |child, &place| {
+        let op = child.borrow();
+        if skips_scope(&op) {
+            return Walk::Skip;
+        }
+        match &op.parsed_data {
+            _ if place.skipped => storages
+                .extend(question_storage(&op).filter(|storage| place.in_form && storage.password)),
+            ParsedOperation::VarStore(store) => {
+                declared.push(Declared::Store(StoreDeclaration::new(
+                    store.var_store_id,
+                    store.guid,
+                    DeclaredKind::Buffer {
+                        name: store.name.to_string(),
+                        blocks: Vec::new(),
+                    },
+                )));
+            }
+            ParsedOperation::VarStoreNameValue(store) => {
+                declared.push(Declared::Store(StoreDeclaration::new(
+                    store.var_store_id,
+                    store.guid,
+                    DeclaredKind::NameValue { names: Vec::new() },
+                )));
+            }
+            ParsedOperation::VarStoreEfi(store) => {
+                declared.push(Declared::Store(StoreDeclaration::new(
+                    store.var_store_id,
+                    store.guid,
+                    DeclaredKind::EfiVariable {
+                        name: store.name.to_string(),
+                    },
+                )));
+            }
+            ParsedOperation::ShortVarStoreEfi(store) => {
+                declared.push(Declared::ShortEfi(store.clone()));
+            }
+            _ if place.in_form => storages.extend(question_storage(&op)),
+            _ => {}
+        }
+        Walk::Enter(Place {
+            in_form: place.in_form || matches!(op.op_code, IFROpCode::Form | IFROpCode::FormMap),
+            skipped: place.skipped || skips_questions(&op),
+        })
+    });
+    let stores = declared.iter_mut().filter_map(|declared| match declared {
+        Declared::Store(declaration) => Some(declaration),
+        Declared::ShortEfi(_) => None,
+    });
+    for declaration in stores {
+        let on_store: Vec<&QuestionStorage> = storages
+            .iter()
+            .filter(|storage| storage.var_store_id == declaration.id)
+            .collect();
+        let by_name = matches!(declaration.kind, DeclaredKind::NameValue { .. });
+        let withheld: Vec<&QuestionStorage> = on_store
+            .iter()
+            .copied()
+            .filter(|storage| storage.password)
+            .collect();
+        declaration.holds_password = !withheld.is_empty();
+        let requested = on_store.into_iter().filter(|storage| {
+            !withheld
+                .iter()
+                .any(|password| password.overlaps(storage, by_name))
+        });
+        for storage in requested {
+            match &mut declaration.kind {
+                DeclaredKind::Buffer { blocks, .. } => {
+                    if !blocks.contains(&storage.block) {
+                        blocks.push(storage.block);
+                    }
+                }
+                DeclaredKind::NameValue { names } => {
+                    let name = texts.stored(storage.var_store_info).to_owned();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                DeclaredKind::EfiVariable { .. } => {}
+            }
+        }
+    }
+    declared
+        .into_iter()
+        .flat_map(|declared| match declared {
+            Declared::Store(declaration) => vec![declaration],
+            Declared::ShortEfi(store) => {
+                let mut variables: Vec<StoreDeclaration> = Vec::new();
+                let on_store = storages
+                    .iter()
+                    .filter(|storage| storage.var_store_id == store.var_store_id);
+                for storage in on_store {
+                    for key in store.candidate_variables(storage.var_store_info) {
+                        let kind = DeclaredKind::EfiVariable { name: key.name };
+                        match variables.iter_mut().find(|variable| variable.kind == kind) {
+                            Some(variable) => variable.holds_password |= storage.password,
+                            None => variables.push(StoreDeclaration {
+                                id: store.var_store_id,
+                                guid: key.guid,
+                                kind,
+                                holds_password: storage.password,
+                            }),
+                        }
+                    }
+                }
+                variables
+            }
+        })
+        .collect()
+}
+
+/// The storage of a question: its VarStoreId and VarStoreInfo, the block it spans in a Buffer
+/// store, and whether it is a PASSWORD question's.
+struct QuestionStorage {
+    var_store_id: u16,
+    var_store_info: u16,
+    block: (u16, NonZeroUsize),
+    password: bool,
+}
+
+impl QuestionStorage {
+    /// Whether this storage covers any of `other`'s: the same VarName in a Name/Value store,
+    /// whose settings go `by_name`, a common byte in a Buffer store.
+    fn overlaps(&self, other: &Self, by_name: bool) -> bool {
+        match by_name {
+            true => self.var_store_info == other.var_store_info,
+            false => {
+                let (mine, theirs) = (self.span(), other.span());
+                mine.start < theirs.end && theirs.start < mine.end
+            }
+        }
+    }
+
+    /// The bytes of its block.
+    fn span(&self) -> std::ops::Range<usize> {
+        let (offset, width) = self.block;
+        let start = usize::from(offset);
+        start..start + width.get()
+    }
+}
+
+impl StoreDeclaration {
+    /// A store of `kind`, as its VARSTORE op declares it, before its questions are added.
+    fn new(id: u16, guid: Guid, kind: DeclaredKind) -> Self {
+        Self {
+            id,
+            guid,
+            kind,
+            holds_password: false,
+        }
+    }
+}
+
+/// The storage of the question op `op`, with the StorageWidth of edk2-stable202608
+/// SetupBrowserDxe IfrParse.c for its kind; None for an op without storage and a DATE or TIME
+/// kept elsewhere. A PASSWORD spans its MaxSize CHAR16s, also with EFI_IFR_FLAG_CALLBACK, whose
+/// driver keeps it encoded there and a forms browser requests nothing of (IfrParse.c:684-690).
+fn question_storage(op: &IFROperation) -> Option<QuestionStorage> {
+    let data = &op.data;
+    // Prompt, Help and QuestionId, then VarStoreId and VarStoreInfo (UEFI 2.11 §33.3.8.2.2)
+    let &[_, _, _, _, _, _, id_low, id_high, info_low, info_high, ..] =
+        data.first_chunk::<QUESTION_HEADER_SIZE>()?;
+    let var_store_id = u16::from_le_bytes([id_low, id_high]);
+    let var_store_info = u16::from_le_bytes([info_low, info_high]);
+    if var_store_id == 0 {
+        return None;
+    }
+    let bit_field = refers_to_bit_field(op);
+    let width = match op.op_code {
+        IFROpCode::OneOf | IFROpCode::Numeric if bit_field => {
+            let bits = after_header(data, 0)? & EDKII_IFR_NUMERIC_SIZE_BIT;
+            return bit_field_storage(var_store_id, var_store_info, bits);
+        }
+        IFROpCode::CheckBox if bit_field => {
+            return bit_field_storage(var_store_id, var_store_info, 1);
+        }
+        IFROpCode::OneOf | IFROpCode::Numeric => {
+            1usize << (after_header(data, 0)? & EFI_IFR_NUMERIC_SIZE)
+        }
+        IFROpCode::CheckBox => 1,
+        IFROpCode::String => usize::from(after_header(data, 1)?) * size_of::<u16>(),
+        IFROpCode::Password => {
+            let max_size = u16::from_le_bytes([after_header(data, 2)?, after_header(data, 3)?]);
+            return Some(QuestionStorage {
+                var_store_id,
+                var_store_info,
+                block: (
+                    var_store_info,
+                    NonZeroUsize::new(usize::from(max_size) * size_of::<u16>())?,
+                ),
+                password: true,
+            });
+        }
+        IFROpCode::Date if after_header(data, 0)? & QF_STORAGE == QF_STORAGE_NORMAL => DATE_WIDTH,
+        IFROpCode::Time if after_header(data, 0)? & QF_STORAGE == QF_STORAGE_NORMAL => TIME_WIDTH,
+        IFROpCode::OrderedList => {
+            usize::from(after_header(data, 0)?) * ordered_list_element_width(op)?
+        }
+        IFROpCode::Ref => REF_WIDTH,
+        _ => return None,
+    };
+    Some(QuestionStorage {
+        var_store_id,
+        var_store_info,
+        block: (var_store_info, NonZeroUsize::new(width)?),
+        password: false,
+    })
+}
+
+/// The byte `at` of the fields that follow the question header in `data`, a question op's data.
+fn after_header(data: &[u8], at: usize) -> Option<u8> {
+    data.get(QUESTION_HEADER_SIZE + at).copied()
+}
+
+/// The storage of an EDKII bit varstore field of `bits` bits at bit `bit_offset`: the bytes it
+/// spans (IfrParse.c, QuestionReferBitField).
+fn bit_field_storage(var_store_id: u16, bit_offset: u16, bits: u8) -> Option<QuestionStorage> {
+    let width = (usize::from(bit_offset % 8) + usize::from(bits)).div_ceil(8);
+    Some(QuestionStorage {
+        var_store_id,
+        var_store_info: bit_offset,
+        block: (bit_offset / 8, NonZeroUsize::new(width)?),
+        password: false,
+    })
+}
+
+/// The width of an ORDERED_LIST's element: that of its first ONE_OF_OPTION's value type, 1 for
+/// another type, as IfrParse.c takes it.
+fn ordered_list_element_width(op: &IFROperation) -> Option<usize> {
+    question_scope(op).iter().find_map(|option| {
+        let ParsedOperation::OneOfOption(parsed) = &option.borrow().parsed_data else {
+            return None;
+        };
+        Some(match parsed.value {
+            TypeValue::NumSize16(_) => 2,
+            TypeValue::NumSize32(_) => 4,
+            TypeValue::NumSize64(_) => 8,
+            TypeValue::NumSize8(_)
+            | TypeValue::Boolean(_)
+            | TypeValue::Time(_)
+            | TypeValue::Date(_)
+            | TypeValue::StringID(_)
+            | TypeValue::Other
+            | TypeValue::Undefined
+            | TypeValue::Action(_)
+            | TypeValue::Ref(_)
+            | TypeValue::Unknown(_) => 1,
+        })
+    })
+}
+
+#[cfg(test)]
+#[cfg(efivar_dumps)]
+mod store_request_tests {
+    use super::super::ifr_fixtures::*;
+    use super::super::resolve_short_var_names;
+    use super::*;
+    use crate::hii::strings::Language;
+    use crate::hii::strings::StringMap;
+    use crate::hii::strings::StringPackage;
+
+    /// EFI_IFR_FLAG_CALLBACK (UEFI 2.11 §33.3.8.2.2)
+    const EFI_IFR_FLAG_CALLBACK: u8 = 0x04;
+
+    /// A question header of QuestionId `id` on VarStore `var_store_id` at VarOffset `info`, with
+    /// `flags`.
+    fn header(id: u16, var_store_id: u16, info: u16, flags: u8) -> Vec<u8> {
+        [
+            &3u16.to_le_bytes()[..],
+            &4u16.to_le_bytes(),
+            &id.to_le_bytes(),
+            &var_store_id.to_le_bytes(),
+            &info.to_le_bytes(),
+            &[flags],
+        ]
+        .concat()
+    }
+
+    fn width(bytes: usize) -> NonZeroUsize {
+        NonZeroUsize::new(bytes).expect("nonzero")
+    }
+
+    fn declarations(body: &[Vec<u8>]) -> Vec<StoreDeclaration> {
+        store_declarations(
+            &parse_form_set(body).borrow(),
+            &ListTexts::new(&strings(), &[]),
+        )
+    }
+
+    /// The VarName of a name/value storage keeps the common control codes of its string, which
+    /// only the texts that questions show drop: it must match the firmware's own name.
+    #[test]
+    fn name_value_names_keep_their_control_codes() {
+        let named = operation(0x06, false, &[header(0x15, 3, 5, 0), vec![0x00]].concat());
+        let body = [
+            operation(
+                0x25,
+                false,
+                &[&3u16.to_le_bytes()[..], &[0x33; 16]].concat(),
+            ),
+            form(1, &[named]),
+        ];
+        let strings = [en_us_package(StringMap::from([(5, "\u{F620}Name".into())]))];
+
+        let stores = store_declarations(
+            &parse_form_set(&body).borrow(),
+            &ListTexts::new(&strings, &[]),
+        );
+
+        assert_eq!(
+            stores,
+            [StoreDeclaration {
+                id: 3,
+                guid: [0x33; 16].into(),
+                kind: DeclaredKind::NameValue {
+                    names: vec!["\u{F620}Name".to_string()]
+                },
+                holds_password: false,
+            }],
+            "the VarName as stored"
+        );
+    }
+
+    #[test]
+    fn store_settings_follow_the_widths_a_forms_browser_requests() {
+        let string = operation(
+            0x1C,
+            false,
+            &[header(0x10, 2, 0x10, 0), vec![1, 4, 0]].concat(),
+        );
+        let date_rtc = operation(
+            0x1A,
+            false,
+            &[header(0x12, 2, 0x30, 0), vec![0x10]].concat(),
+        );
+        let time = operation(
+            0x1B,
+            false,
+            &[header(0x13, 2, 0x34, 0), vec![0x00]].concat(),
+        );
+        let uint16 = operation(
+            0x07,
+            false,
+            &[header(0x14, 2, 0x38, 0), vec![0x01], vec![0; 6]].concat(),
+        );
+        let named = operation(0x06, false, &[header(0x15, 3, 5, 0), vec![0x00]].concat());
+        let body = [
+            var_store(2, [0x22; 16], "Buffer", 0x40),
+            operation(
+                0x25,
+                false,
+                &[&3u16.to_le_bytes()[..], &[0x33; 16]].concat(),
+            ),
+            var_store_efi(1, "Store", NV_BS_RT, 4),
+            form(1, &[string, date_rtc, time, uint16, named]),
+            // outside any form: no browser requests it
+            checkbox_at(0x16, 7, 2, 0x3F),
+        ];
+
+        let stores = declarations(&body);
+
+        assert_eq!(
+            stores,
+            [
+                StoreDeclaration {
+                    id: 2,
+                    guid: [0x22; 16].into(),
+                    kind: DeclaredKind::Buffer {
+                        name: "Buffer".into(),
+                        blocks: vec![(0x10, width(8)), (0x34, width(3)), (0x38, width(2))],
+                    },
+                    holds_password: false,
+                },
+                StoreDeclaration {
+                    id: 3,
+                    guid: [0x33; 16].into(),
+                    kind: DeclaredKind::NameValue {
+                        names: vec![ListTexts::new(&strings(), &[]).stored(5).to_owned()]
+                    },
+                    holds_password: false,
+                },
+                StoreDeclaration {
+                    id: 1,
+                    guid: [0; 16].into(),
+                    kind: DeclaredKind::EfiVariable {
+                        name: "Store".into()
+                    },
+                    holds_password: false,
+                },
+            ],
+            "STRING of 4 CHAR16, TIME, UINT16 NUMERIC, no RTC DATE; the VarName on the \
+             Name/Value store; the EFI variable store"
+        );
+    }
+
+    #[test]
+    fn password_bytes_and_names_are_withheld_and_mark_their_store() {
+        // a PASSWORD of 20 CHAR16 at bytes 0x10-0x37 of the Buffer store
+        let password = password_on(0x11, 4, 2, 0x10);
+        let callback_password = operation(
+            PASSWORD,
+            false,
+            &[
+                header(0x12, 2, 0x40, EFI_IFR_FLAG_CALLBACK),
+                [&1u16.to_le_bytes()[..], &8u16.to_le_bytes()].concat(),
+            ]
+            .concat(),
+        );
+        let before = checkbox_at(0x13, 7, 2, 0x0F);
+        let inside = checkbox_at(0x14, 7, 2, 0x20);
+        let straddling = operation(
+            NUMERIC,
+            false,
+            &[header(0x15, 2, 0x36, 0), vec![0x01], vec![0; 6]].concat(),
+        );
+        let after = checkbox_at(0x16, 7, 2, 0x38);
+        let inside_callback = checkbox_at(0x17, 7, 2, 0x4F);
+        let named_password = password_on(0x18, 4, 3, 5);
+        let named = operation(0x06, false, &[header(0x19, 3, 5, 0), vec![0x00]].concat());
+        let other_name = operation(0x06, false, &[header(0x1A, 3, 6, 0), vec![0x00]].concat());
+        let body = [
+            var_store(2, [0x22; 16], "Buffer", 0x60),
+            operation(
+                0x25,
+                false,
+                &[&3u16.to_le_bytes()[..], &[0x33; 16]].concat(),
+            ),
+            var_store(4, [0x44; 16], "Other", 1),
+            form(
+                1,
+                &[
+                    password,
+                    callback_password,
+                    before,
+                    inside,
+                    straddling,
+                    after,
+                    inside_callback,
+                    named_password,
+                    named,
+                    other_name,
+                    checkbox_at(0x1B, 7, 4, 0),
+                ],
+            ),
+        ];
+
+        let stores = declarations(&body);
+
+        assert_eq!(
+            stores[0].kind,
+            DeclaredKind::Buffer {
+                name: "Buffer".into(),
+                blocks: vec![(0x0F, width(1)), (0x38, width(1))],
+            },
+            "only the bytes outside both PASSWORDs, with or without EFI_IFR_FLAG_CALLBACK"
+        );
+        assert_eq!(
+            stores[1].kind,
+            DeclaredKind::NameValue {
+                names: vec![ListTexts::new(&strings(), &[]).stored(6).to_owned()]
+            },
+            "only the VarName that no PASSWORD names"
+        );
+        assert_eq!(
+            stores
+                .iter()
+                .map(|store| (store.id, store.holds_password))
+                .collect::<Vec<_>>(),
+            [(2, true), (3, true), (4, false)],
+            "the stores that PASSWORD questions name hold a password, the other not"
+        );
+    }
+
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes skips a DISABLE_IF outside forms
+    /// whose condition is TRUE to its END (:1390-1413), with the VarStore ops and questions in
+    /// it: no setting of those questions is requested and no store of those VarStore ops
+    /// declared, but the bytes of a PASSWORD there stay withheld and mark its store. A DISABLE_IF
+    /// whose condition is FALSE or not known leaves its questions requested.
+    #[test]
+    fn a_true_form_set_disable_if_requests_no_setting_and_declares_no_store_in_it() {
+        let body = [
+            var_store(2, [0x22; 16], "Buffer", 0x60),
+            form(1, &[checkbox_at(0x10, 7, 2, 0x00)]),
+            conditional(
+                DISABLE_IF,
+                ifr_true(),
+                &[
+                    var_store(3, [0x33; 16], "Hidden", 1),
+                    form(
+                        2,
+                        &[
+                            checkbox_at(0x11, 7, 2, 0x01),
+                            checkbox_at(0x12, 7, 3, 0),
+                            // a PASSWORD of 20 CHAR16 at bytes 0x10-0x37
+                            password_on(0x13, 4, 2, 0x10),
+                        ],
+                    ),
+                ],
+            ),
+            form(3, &[checkbox_at(0x14, 7, 2, 0x20)]),
+            conditional(
+                DISABLE_IF,
+                ifr_false(),
+                &[form(4, &[checkbox_at(0x15, 7, 2, 0x02)])],
+            ),
+            conditional(
+                DISABLE_IF,
+                eq_id_val_of(0x10, 1),
+                &[form(5, &[checkbox_at(0x16, 7, 2, 0x03)])],
+            ),
+        ];
+
+        assert_eq!(
+            declarations(&body),
+            [StoreDeclaration {
+                id: 2,
+                guid: [0x22; 16].into(),
+                kind: DeclaredKind::Buffer {
+                    name: "Buffer".into(),
+                    blocks: vec![(0x00, width(1)), (0x02, width(1)), (0x03, width(1))],
+                },
+                holds_password: true,
+            }],
+            "bytes 0x00, 0x02 and 0x03, of the questions outside the TRUE DISABLE_IF; none of \
+             its questions, nor its VarStore 3, nor byte 0x20, a byte of the PASSWORD in it"
+        );
+    }
+
+    /// A VARSTORE_EFI before UEFI 2.3.1 declares, in its place, the EFI variable of its Guid that
+    /// the VarName of each of its questions names, once, which holds a password if a PASSWORD
+    /// names it, whatever other question names it too; for a VarName that the strings packages
+    /// differ on, the variable of each string.
+    #[test]
+    fn a_short_var_store_declares_the_variable_of_each_var_name() {
+        let body = [
+            var_store_efi(1, "Store", NV_BS_RT, 4),
+            short_var_store_efi(2),
+            var_store(3, [0x33; 16], "Buffer", 1),
+            form(
+                1,
+                &[
+                    checkbox_at(0x10, 3, 2, 10),
+                    password_on(0x11, 3, 2, 11),
+                    checkbox_at(0x12, 3, 2, 10),
+                    checkbox_at(0x15, 3, 2, 11),
+                    checkbox_at(0x13, 3, 2, 12),
+                    checkbox_at(0x14, 3, 3, 0),
+                ],
+            ),
+        ];
+        let root = parse_form_set(&body);
+        let packages =
+            [("en-US", "Differs"), ("fr-FR", "Differe")].map(|(language, differs)| StringPackage {
+                language: Language(language.as_bytes().to_vec()),
+                strings: StringMap::from([
+                    (10, Rc::from("Value")),
+                    (11, Rc::from("Password")),
+                    (12, Rc::from(differs)),
+                ]),
+                replaced: Default::default(),
+            });
+        resolve_short_var_names(&[Rc::clone(&root)], &packages);
+        let variable = |id, guid: [u8; 16], name: &str, holds_password| StoreDeclaration {
+            id,
+            guid: guid.into(),
+            kind: DeclaredKind::EfiVariable { name: name.into() },
+            holds_password,
+        };
+
+        let stores = store_declarations(&root.borrow(), &ListTexts::new(&strings(), &[]));
+
+        assert_eq!(
+            stores,
+            [
+                variable(1, [0; 16], "Store", false),
+                variable(2, SHORT_VAR_STORE_GUID, "Value", false),
+                variable(2, SHORT_VAR_STORE_GUID, "Password", true),
+                variable(2, SHORT_VAR_STORE_GUID, "Differs", false),
+                variable(2, SHORT_VAR_STORE_GUID, "Differe", false),
+                StoreDeclaration {
+                    id: 3,
+                    guid: [0x33; 16].into(),
+                    kind: DeclaredKind::Buffer {
+                        name: "Buffer".into(),
+                        blocks: vec![(0, width(1))],
+                    },
+                    holds_password: false,
+                },
+            ],
+            "the VARSTORE_EFI; Value once, Password, which a CHECKBOX names after the PASSWORD, \
+             both strings of VarName 12, in IFR order; the VARSTORE after them"
+        );
+    }
 }

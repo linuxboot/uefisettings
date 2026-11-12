@@ -43,11 +43,11 @@ use crate::hii_get;
 use crate::hii_set;
 use crate::print_json;
 use crate::write_extracted_db;
-use crate::HiiSourceArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
 use crate::READ_ONLY_WRITE;
+use crate::STAGED_SETUP_PASSWORD;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -56,12 +56,29 @@ pub(super) const GET_ABOUT: &str = "Get the current value of a question";
 /// The about of top-level set, which writes this machine's variables, as hii set does.
 pub(super) const SET_ABOUT: &str = "Set/change the value of a question";
 
-/// The help of --hii-source, which this build ignores.
-pub(super) const HII_SOURCE_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB through the HiiDB driver";
-/// The help of --efivar-memory, which this build ignores.
-pub(super) const EFIVAR_MEMORY_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB through the HiiDB driver";
+/// None: this build reads this machine's HiiDB through the HiiDB driver alone, so it has no
+/// --hii-source or --efivar-memory, which clap refuses as unexpected arguments rather than ignore
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceArgs {}
+
+impl HiiSourceArgs {
+    /// Ok: neither flag exists here.
+    pub(super) fn refuse_given(&self, _why: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The Linux build's seam to the HII backend, which its tests replace; empty, as the commands
+/// here reach the HiiDB driver directly.
+pub(super) trait MachineHii {}
+
+/// This machine's firmware.
+pub(super) struct Firmware;
+
+impl MachineHii for Firmware {}
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
@@ -82,7 +99,7 @@ pub(super) fn stderr_output() -> io::Result<UnicodeTerminal> {
 pub(super) enum PlatformCommands {}
 
 impl PlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match *self {}
     }
 }
@@ -96,7 +113,7 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match self {
             Self::ExtractDB { filename } => {
                 write_extracted_db(filename, HiiBackend::export_hiidb)?;
@@ -124,7 +141,12 @@ pub(super) struct HiiDbArgs {
 impl HiiDbArgs {
     /// The HiiDB: the file, else this machine's, through the HiiDB driver, whatever `_source`
     /// names.
-    pub(super) fn read(&self, efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
+    pub(super) fn read(
+        &self,
+        efivars: &EfivarSource,
+        _source: &HiiSourceArgs,
+        _hii: &impl MachineHii,
+    ) -> Result<Vec<u8>> {
         HiiBackend::read_hiidb(self.filename.as_deref(), efivars)
     }
 }
@@ -156,8 +178,31 @@ impl EfivarArgs {
 
 /// The unsafe operations of set, which its long help lists: Windows writes through the
 /// firmware environment calls, which reach runtime variables like efivarfs, so no setup password
-/// gates them, as on Linux.
-pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE];
+/// gates them, as on Linux, and a set staged for the next boot, which one does.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE, STAGED_SETUP_PASSWORD];
+
+/// What set stages for the next boot.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct StagingArgs {
+    /// The uefisettings.efi that set copies to the EFI system partition when it stages a question whose value only its driver holds, which the next boot applies. Under Secure Boot, it must be signed for db.
+    #[arg(long, value_name = "UEFISETTINGS_EFI")]
+    image: Option<PathBuf>,
+    /// Where you mounted the EFI system partition, such as S: after `mountvol S: /s`, for set to write the staged files through instead of the partition's volume GUID path. set checks that the volume there is the EFI system partition that it finds.
+    #[arg(long, value_name = "MOUNT_POINT")]
+    esp: Option<PathBuf>,
+}
+
+impl StagingArgs {
+    pub(super) fn image(&self) -> Option<PathBuf> {
+        self.image.clone()
+    }
+
+    pub(super) fn esp(&self) -> Option<PathBuf> {
+        self.esp.clone()
+    }
+}
 
 /// get, in this machine's HiiDB.
 pub(super) fn auto_get(
@@ -166,6 +211,7 @@ pub(super) fn auto_get(
     selection: &SelectionArgs,
     _unsafe_operations: &HiiSourceUnsafeArgs,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
@@ -194,11 +240,13 @@ pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
     _selection: &SelectionArgs,
+    _staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
+    hii: &impl MachineHii,
 ) -> Result<()> {
     let (question, value) = target.target()?;
-    hii_set(question, &value, options, json, source)
+    hii_set(question, &value, options, json, source, hii)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
@@ -207,6 +255,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_using(question, value, None, options)
 }

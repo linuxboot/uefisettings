@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -35,6 +36,7 @@ use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
 use crate::hii::strings::Language;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::MatchTier;
 use crate::hii::strings::StringPackage;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
@@ -61,9 +63,9 @@ use conditions::parse_question_header;
 use conditions::question_state;
 use conditions::retrieve_question_value;
 use conditions::select;
+use conditions::skips_questions;
 use conditions::skips_scope;
 use conditions::ExpressionInputs;
-use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::Truth;
 use conditions::VarStoreValues;
@@ -122,38 +124,51 @@ use storage::VariableNotExported;
 use storage::VariableStore;
 use storageless::NoVarStore;
 use storageless::StoragelessQuestion;
-use storageless::StoragelessRefusal;
-use storageless::StoragelessRoute;
 use string_question::display_string_answer;
 use string_question::StringInput;
 use string_question::StringQuestion;
 use time_storage::TimeStorage;
 use time_storage::TimeStorageOnly;
 
-pub use ami_access_level::AccessLevel;
+pub use assumed_var_store::AssumedVarStore;
+pub use assumed_var_store::AssumedVarStoreError;
 pub use conditions::IncludedStates;
 pub use conditions::QuestionState;
 pub use conditions::SelectionError;
 
-pub(crate) use ami_access_level::check_access_level;
+pub(crate) use assumed_var_store::check_assumed;
+pub(crate) use assumed_var_store::CheckedVarStores;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Exclusion;
+pub(crate) use conditions::QuestionExpression;
 pub(crate) use conditions::RankedBefore;
 pub(crate) use conditions::ReadOnlyCause;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
 pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
+pub(crate) use driver_held::DriverHeldQuestion;
+pub(crate) use driver_held::ExpressionBesideCallback;
+#[cfg(variable_data)]
+pub(crate) use driver_held::IfrValueType;
+pub(crate) use set::check_one_kind;
 pub(crate) use set::set_questions;
+pub(crate) use set::DriverStore;
 pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
 pub(crate) use setup_password::UnresolvedPassword;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use storage::DeclaredKind;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use storage::StoreDeclaration;
+pub(crate) use storageless::StoragelessRefusal;
 
-mod ami_access_level;
+mod assumed_var_store;
 mod conditions;
 mod cross_reference;
 mod date_time;
 mod defaults;
+mod driver_held;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
 #[cfg_attr(
@@ -1047,6 +1062,20 @@ pub struct FormSet {
     /// declared_var_store refuses a lookup of such an id
     #[br(default)]
     pub(super) var_stores_in_disabled_forms: BTreeSet<u16>,
+    /// The FORM_SET op that its package list starts with, which edk2-stable202608
+    /// SetupBrowserDxe/Setup.c GetIfrBinaryData takes for a Nil FormSet GUID (:6075):
+    /// read_package_list marks it, else None
+    #[br(default)]
+    pub(super) package_list_first: Option<PackageListFirst>,
+}
+
+/// The FORM_SET op that a package list starts with, as one of its FormSets sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PackageListFirst {
+    /// Its own
+    Own,
+    /// Another, of this GUID, if the op holds one
+    Other(Option<Guid>),
 }
 
 impl FormSet {
@@ -1290,7 +1319,7 @@ impl NumericRange {
 
 /// The stored width in bits, 1 to 64, of a NUMERIC or ONE_OF value, and, if
 /// EFI_IFR_DISPLAY_INT_DEC signs it, the width of its type.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NumericFormat {
     bits: u32,
     signed_type_bits: Option<u32>,
@@ -1995,6 +2024,7 @@ pub(super) fn parse_form_sets(
     // the ops outside a FormSet that the walk steps over, and the VarStores in the scope of an
     // unknown opcode in a FormSet that parses, by offset
     let mut walked = Vec::new();
+    let mut first_form_set = None;
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
@@ -2037,6 +2067,14 @@ pub(super) fn parse_form_sets(
         if let Some(start) = open_past_end.take() {
             past_end.push(start..offset);
         }
+        // GetIfrBinaryData takes the first FORM_SET op for a Nil GUID, whether it parses or not
+        let first_op = first_form_set.is_none();
+        if first_op {
+            first_form_set = Some(FirstFormSet {
+                guid: op.data.first_chunk().map(|&guid| Guid::from(guid)),
+                parses: false,
+            });
+        }
         let failure = match failing_alike.remove(&offset) {
             Some(failure) => failure,
             None => {
@@ -2052,6 +2090,9 @@ pub(super) fn parse_form_sets(
                         var_stores.extend(parsed.var_stores);
                         let roots_before = roots.len();
                         roots.push(parsed.root);
+                        if let (true, Some(first)) = (first_op, &mut first_form_set) {
+                            first.parses = true;
+                        }
                         disabled_forms.extend(
                             parsed
                                 .disabled_forms
@@ -2121,7 +2162,7 @@ pub(super) fn parse_form_sets(
             &mut malformed_stores,
         );
     }
-    let (first_var_stores, name_value_first) = first_var_stores(&var_stores, &outside);
+    let (first_var_stores, name_value_first, declared) = first_var_stores(&var_stores, &outside);
     Ok(FormSets {
         roots,
         ignored,
@@ -2130,6 +2171,8 @@ pub(super) fn parse_form_sets(
         malformed_stores,
         first_var_stores,
         name_value_first,
+        declared,
+        first_form_set,
     })
 }
 
@@ -2142,11 +2185,16 @@ pub(super) fn parse_form_sets(
 /// the package, as it walks the package op by op (:1520-1567), FORM_SET ops or not, so a FormSet
 /// nested in another is another FormSet, and steps into the scope of an unknown opcode as into any
 /// (:1566). An id whose first VarStore is outside any FormSet or in such a scope has no FormSet's:
-/// PasswordQuestions withholds those as VarStores outside any FormSet.
+/// PasswordQuestions withholds those as VarStores outside any FormSet. Every id of those
+/// VarStores comes third: for a question of the package of an id of none, the Forms Browser and
+/// FindStorageFromVarId find none but a VarStore op that does not decode, which each reads
+/// whatever the op's Length: the Forms Browser one of the question's FormSet outside an unknown
+/// opcode's scope (SetupBrowserDxe/IfrParse.c ParseOpCodes, :1873-1918), FindStorageFromVarId the
+/// first in the package (:1538-1555).
 fn first_var_stores(
     var_stores: &[(u64, Rc<RefCell<IFROperation>>)],
     outside: &[OutsideOp],
-) -> (BTreeMap<u16, FirstVarStore>, BTreeSet<u16>) {
+) -> (BTreeMap<u16, FirstVarStore>, BTreeSet<u16>, BTreeSet<u16>) {
     let in_form_sets = var_stores.iter().filter_map(|(offset, store)| {
         let (var_store_id, declared) = declared_store(&store.borrow().parsed_data)?;
         Some((*offset, var_store_id, declared, Some(store)))
@@ -2175,11 +2223,12 @@ fn first_var_stores(
         });
         first.insert(var_store_id, declared_by);
     }
+    let declared = first.keys().copied().collect();
     let first = first
         .into_iter()
         .filter_map(|(var_store_id, first)| Some((var_store_id, first?)))
         .collect();
-    (first, name_value_first)
+    (first, name_value_first, declared)
 }
 
 /// Where an op that parse_form_sets records outside the FormSets that it parses sits.
@@ -2565,8 +2614,9 @@ fn form_set_name(op: &IFROperation) -> String {
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
 /// ignores, the forms that it drops from those roots, the VarStores and statements outside the
 /// FormSets that it parses, with the VarStores in the scope of an unknown opcode in those,
-/// malformed VarStores apart, the first VarStore of each VarStoreId that a FormSet declares, and
-/// the VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE (first_var_stores).
+/// malformed VarStores apart, the first VarStore of each VarStoreId that a FormSet declares, the
+/// VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE, and every VarStoreId that a VarStore
+/// that decodes declares (first_var_stores), and its first FORM_SET op (first_form_set).
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
@@ -2575,6 +2625,39 @@ pub(super) struct FormSets {
     pub(super) malformed_stores: Vec<IgnoredIfr>,
     pub(super) first_var_stores: BTreeMap<u16, FirstVarStore>,
     pub(super) name_value_first: BTreeSet<u16>,
+    pub(super) declared: BTreeSet<u16>,
+    pub(super) first_form_set: Option<FirstFormSet>,
+}
+
+/// The first FORM_SET op of a form package.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FirstFormSet {
+    /// Its GUID, if the op holds one
+    pub(super) guid: Option<Guid>,
+    /// Whether its FormSet parses, as the first of FormSets::roots
+    pub(super) parses: bool,
+}
+
+/// Marks the FormSet of each of `roots`, those of one package list, with the FORM_SET op that the
+/// list starts with: `first`, of the form package whose roots start at the index it pairs with.
+pub(super) fn mark_package_list_first(
+    roots: &[Rc<RefCell<IFROperation>>],
+    first: Option<(usize, FirstFormSet)>,
+) {
+    let Some((at, first)) = first else {
+        return;
+    };
+    for (index, root) in roots.iter().enumerate() {
+        let mark = match (first.parses, index == at) {
+            (true, true) => PackageListFirst::Own,
+            (true, false) | (false, _) => PackageListFirst::Other(first.guid),
+        };
+        for child in &root.borrow().children {
+            if let ParsedOperation::FormSet(form_set) = &mut child.borrow_mut().parsed_data {
+                form_set.package_list_first = Some(mark);
+            }
+        }
+    }
 }
 
 /// The FormSets of a form package of a package list, by index in its forms, which the forms that
@@ -2591,6 +2674,8 @@ pub(crate) struct FirstVarStores {
     /// The VarStoreIds whose first VarStore in the package, in a FormSet or not, is a
     /// VARSTORE_NAME_VALUE
     pub(crate) name_value_first: BTreeSet<u16>,
+    /// Every VarStoreId that a VarStore of the package that decodes declares, in a FormSet or not
+    pub(crate) declared: BTreeSet<u16>,
 }
 
 /// The first VarStore op of a VarStoreId of a form package, `store`, and the FORM_SET op nearest
@@ -2650,6 +2735,9 @@ pub struct DisabledForm {
     /// The index of the root of its FormSet among the roots that its parse returns: in the forms
     /// of its package list (ParsedPackageList::forms) for read_db
     pub root_index: usize,
+    /// The name of its first PASSWORD or VarStore op, which record_disabled_var_stores finds
+    /// (DriverHeldQuestion::check_disabled_forms)
+    pub(crate) store_op: Option<&'static str>,
 }
 
 impl DisabledForm {
@@ -2849,7 +2937,7 @@ fn handle_form_set_within(
                 }
                 None => debug!("IFR:End when parent_ref is none"),
             };
-            if let Some(disabled) =
+            if let Some(mut disabled) =
                 disabling.take_if(|disabled| Rc::ptr_eq(&disabled.form, &current_scope_clone))
             {
                 // every op after the form went into its scope, so it is its parent's last child
@@ -2867,7 +2955,7 @@ fn handle_form_set_within(
                     }
                 }
                 drop(parent);
-                record_disabled_var_stores(&disabled.form);
+                disabled.store_op = record_disabled_var_stores(&disabled.form);
                 disabled_forms.push(disabled);
             }
 
@@ -2934,6 +3022,8 @@ fn handle_form_set_within(
                     form,
                     // the one root that this parse returns
                     root_index: 0,
+                    // record_disabled_var_stores finds it once the form's End is read
+                    store_op: None,
                 };
                 debug!(
                     "disabling, at offset {}, {}",
@@ -3271,10 +3361,23 @@ fn record_var_store_in_form(op: &IFROperation) {
 }
 
 /// Records the VarStoreId of each VarStore op of the disabled form `form` in the FormSet that
-/// holds it (FormSet::var_stores_in_disabled_forms).
-fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) {
+/// holds it (FormSet::var_stores_in_disabled_forms); returns the name of its first PASSWORD or
+/// VarStore op (DisabledForm::store_op).
+fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) -> Option<&'static str> {
+    let mut store_op = None;
     walk_scopes(std::slice::from_ref(form), (), |node, ()| {
         let op = node.borrow();
+        if store_op.is_none()
+            && matches!(
+                op.op_code,
+                IFROpCode::Password
+                    | IFROpCode::VarStore
+                    | IFROpCode::VarStoreNameValue
+                    | IFROpCode::VarStoreEfi
+            )
+        {
+            store_op = Some(op.op_code.spec_name());
+        }
         if let (Some((var_store_id, _)), Some(form_set)) =
             (declared_store(&op.parsed_data), form_set_of_form(&op))
         {
@@ -3284,6 +3387,7 @@ fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) {
         }
         Walk::Enter(())
     });
+    store_op
 }
 
 /// The FormSet that holds `op` if a FORM or FORM_MAP of that FormSet holds `op`.
@@ -3487,6 +3591,8 @@ pub struct QuestionDescriptor {
     pub(crate) value_source: ValueSource,
     /// The question's op, whose WRITE expression set evaluates
     node: Rc<RefCell<IFROperation>>,
+    /// What get and set need if no VarStore but the question's driver holds its value
+    driver_held: Option<DriverHeldQuestion>,
 }
 impl fmt::Debug for QuestionDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3516,15 +3622,62 @@ enum TextInput {
 }
 
 impl TextInput {
-    /// The name of its variant, which an internal inconsistency names.
-    fn kind(&self) -> &'static str {
+    /// Its variant, which an internal inconsistency names.
+    fn kind(&self) -> TextInputKind {
         match self {
-            Self::Range(_) => "Range",
-            Self::Maximum(_) => "Maximum",
-            Self::DateTime(_) => "DateTime",
-            Self::OrderedList(_) => "OrderedList",
+            Self::Range(_) => TextInputKind::Range,
+            Self::Maximum(_) => TextInputKind::Maximum,
+            Self::DateTime(_) => TextInputKind::DateTime,
+            Self::OrderedList(_) => TextInputKind::OrderedList,
+            Self::CrossReference => TextInputKind::CrossReference,
+            Self::String(_) => TextInputKind::String,
+        }
+    }
+}
+
+/// The variant of a TextInput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextInputKind {
+    Range,
+    Maximum,
+    DateTime,
+    OrderedList,
+    CrossReference,
+    String,
+}
+
+impl fmt::Display for TextInputKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Range => "Range",
+            Self::Maximum => "Maximum",
+            Self::DateTime => "DateTime",
+            Self::OrderedList => "OrderedList",
             Self::CrossReference => "CrossReference",
-            Self::String(_) => "String",
+            Self::String => "String",
+        };
+        write!(f, "TextInput::{name}")
+    }
+}
+
+/// How a VALUE matches the text of an option (QuestionDescriptor::select_option).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextMatch {
+    /// Ignoring ASCII case
+    Exact,
+    /// Ignoring ASCII case and surrounding whitespace, as get shows the text trimmed
+    Trimmed,
+}
+
+impl TextMatch {
+    /// The ways, in the order that select_option tries them.
+    const ALL: [Self; 2] = [Self::Exact, Self::Trimmed];
+
+    /// Whether `named`, a VALUE, names `text` this way.
+    fn matches(self, named: &str, text: &str) -> bool {
+        match self {
+            Self::Exact => named.eq_ignore_ascii_case(text),
+            Self::Trimmed => named.trim().eq_ignore_ascii_case(text.trim()),
         }
     }
 }
@@ -3533,9 +3686,12 @@ impl TextInput {
 pub struct AnswerOption {
     /// The option's text, as get shows it
     pub value: String,
-    /// The option's text in each strings package of no configuration language that holds it,
-    /// with its language: those that VALUE matches
+    /// The option's text as stored in each strings package of no configuration language that
+    /// holds it, with its language (ListTexts::matching): those that VALUE matches first
     texts: Vec<(Language, String)>,
+    /// The option's text that display shows in those packages (ListTexts::matching_displayed):
+    /// those that VALUE matches where no text as stored of an option does
+    displayed_texts: Vec<(Language, String)>,
     /// The option's EFI_IFR_ONE_OF_OPTION Type
     value_type: u8,
     /// The option's value, or why it is not known
@@ -3553,6 +3709,16 @@ impl AnswerOption {
             .ok()
             .copied()
             .and_then(TypeValue::as_u64)
+    }
+
+    /// The texts of the option string `id` in `texts` that VALUE matches in `tier`, with their
+    /// languages: AnswerOption's texts or displayed_texts.
+    fn texts_in(texts: &ListTexts<'_>, id: u16, tier: MatchTier) -> Vec<(Language, String)> {
+        texts
+            .matching_in(id, tier)
+            .into_iter()
+            .map(|(language, text)| (language.clone(), text.into_owned()))
+            .collect()
     }
 }
 
@@ -3595,23 +3761,6 @@ impl QuestionDescriptor {
         }
     }
 
-    /// How get (`Read`) or set (`Write`) reaches the value of a question without a VarStore;
-    /// None for one with a VarStore.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
-        )
-    )]
-    pub(crate) fn storageless_route(
-        &self,
-        expression: QuestionExpression,
-    ) -> Option<std::result::Result<StoragelessRoute, StoragelessRefusal>> {
-        let NoVarStore(storageless) = self.varstore.as_ref().err()?.downcast_ref::<NoVarStore>()?;
-        Some(storageless.route(expression))
-    }
-
     /// The texts of the options of the stored items of an ORDERED_LIST, in order, as get shows
     /// them without their states; None for another question, or one whose items cannot be read.
     pub(crate) fn items(&self) -> Option<Vec<String>> {
@@ -3636,16 +3785,24 @@ impl QuestionDescriptor {
             .ok_or_else(|| ChangeValueError::InvalidOption.into())
     }
 
-    /// The options of a text in a language of no configuration language that `names` takes,
-    /// each with those languages.
-    fn options_named(&self, names: impl Fn(&str) -> bool) -> Vec<(&AnswerOption, OptionMatch)> {
+    /// The options of a text, as `tier` takes the texts, in a language of no configuration
+    /// language that `text_match` takes for one of `texts`, each with those languages.
+    fn options_named(
+        &self,
+        tier: MatchTier,
+        text_match: TextMatch,
+        texts: &BTreeSet<String>,
+    ) -> Vec<(&AnswerOption, OptionMatch)> {
         self.possible_options
             .iter()
             .filter_map(|option| {
-                let languages: Vec<String> = option
-                    .texts
+                let option_texts = match tier {
+                    MatchTier::Stored => &option.texts,
+                    MatchTier::Displayed => &option.displayed_texts,
+                };
+                let languages: Vec<String> = option_texts
                     .iter()
-                    .filter(|(_, text)| names(text))
+                    .filter(|(_, text)| texts.iter().any(|named| text_match.matches(named, text)))
                     .map(|(language, _)| language.to_string())
                     .collect();
                 let named = OptionMatch {
@@ -3671,27 +3828,24 @@ impl QuestionDescriptor {
     }
 
     /// Returns the option that select() picks with `include` among those whose text in a
-    /// language of no configuration language is one of `texts` ignoring ASCII case, or, if there
-    /// are none, among those whose text is one of `texts` ignoring surrounding whitespace too
-    /// (get shows the text trimmed), or None if there are none either. So a text as stored never
-    /// picks an option that differs from it only by such whitespace. Refuses with
-    /// SelectionError::AmbiguousOption options that no one language names all.
+    /// language of no configuration language is one of `texts`, in the first of these ways that
+    /// names any, or None if none does: of the texts as stored, then of those that display shows
+    /// (MatchTier), each ignoring ASCII case, then ignoring surrounding whitespace too (get shows
+    /// the text trimmed). So a text as stored never picks an option that differs from it only by
+    /// such whitespace, or that reads alike only once a character of it is replaced or its common
+    /// control codes are taken out. Refuses with SelectionError::AmbiguousOption options that no
+    /// one language names all.
     pub(crate) fn select_option(
         &self,
         texts: &BTreeSet<String>,
         include: IncludedStates,
     ) -> std::result::Result<Option<&AnswerOption>, SelectionError> {
-        let stored =
-            self.options_named(|text| texts.iter().any(|named| named.eq_ignore_ascii_case(text)));
-        let candidates = if stored.is_empty() {
-            self.options_named(|text| {
-                texts
-                    .iter()
-                    .any(|named| named.trim().eq_ignore_ascii_case(text.trim()))
-            })
-        } else {
-            stored
-        };
+        let candidates = MatchTier::ALL
+            .into_iter()
+            .flat_map(|tier| TextMatch::ALL.map(|text_match| (tier, text_match)))
+            .map(|(tier, text_match)| self.options_named(tier, text_match, texts))
+            .find(|candidates| !candidates.is_empty())
+            .unwrap_or_default();
         let language_sets: Vec<&[String]> = candidates
             .iter()
             .map(|(_, named)| named.languages.as_slice())
@@ -3750,17 +3904,37 @@ impl QuestionDescriptor {
 // list_questions returns a list of QuestionDescriptors in a FormSet
 // with their states, of the questions in a state that `include` may allow
 // node should be the root of a FormSet
-// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value
+// conditions read the VarStore bytes that `assumed` states in place of those their variables hold
 pub(crate) fn list_questions(
     node: Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     include: IncludedStates,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     reader: &mut EfivarReader,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
-    let values = VarStoreValues::new(&node, access_level);
+    let values = VarStoreValues::new(&node, assumed);
     list_questions_in(
         &node,
+        skips_questions,
+        &mut FormSetWalk::new(texts, reader, &values, include),
+    )
+}
+
+/// Lists questions as list_questions does, those in forms that edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes does not parse too, where --keyword finds statements,
+/// as the edk2 keyword handler does.
+// for dump-efivars, which only Linux and the tests build
+#[cfg(all(efivar_dumps, any(target_os = "linux", test)))]
+pub(crate) fn list_reachable_questions(
+    node: Rc<RefCell<IFROperation>>,
+    texts: &ListTexts<'_>,
+    include: IncludedStates,
+    reader: &mut EfivarReader,
+) -> Vec<(QuestionDescriptor, StateEvaluation)> {
+    let values = VarStoreValues::new(&node, CheckedVarStores::NONE);
+    list_questions_in(
+        &node,
+        skips_scope,
         &mut FormSetWalk::new(texts, reader, &values, include),
     )
 }
@@ -3790,14 +3964,16 @@ impl<'a, V> FormSetWalk<'a, V> {
     }
 }
 
-/// Lists questions as list_questions does, with `walk`.
+/// Lists questions as list_questions does, with `walk`, but those in the scopes that `skips`
+/// skips.
 fn list_questions_in(
     node: &Rc<RefCell<IFROperation>>,
+    skips: impl Fn(&IFROperation) -> bool,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
     let mut res = Vec::new();
     walk_scopes(std::slice::from_ref(node), (), |node, ()| {
-        if skips_scope(&node.borrow()) {
+        if skips(&node.borrow()) {
             return Walk::Skip;
         }
         res.extend(listed_question(node, walk));
@@ -3825,20 +4001,20 @@ fn listed_question(
 /// find_question accepts the root node, texts and what to match questions by: by prompt, a set
 /// of strings which represent variations of the same question, so if a single phrase matches
 /// then we assume that we have the answer; or by QuestionId or keyword (QuestionMatch).
-/// Of the matching questions, it selects one as select does, with conditions reading
-/// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
+/// Of the matching questions, it selects one as select does, with conditions reading the
+/// VarStore bytes that `assumed` states in place of those their variables hold.
 pub(crate) fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     matching: &QuestionMatch<'_, T>,
     include: IncludedStates,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     reader: &mut EfivarReader,
 ) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
-    let values = VarStoreValues::new(&node, access_level);
+    let values = VarStoreValues::new(&node, assumed);
     find_question_in(
         &node,
         matching,
@@ -3871,18 +4047,19 @@ where
         .map(|(question, listed)| describe_question(question, listed, walk))
 }
 
-/// The questions under the root `node` of a FormSet whose prompt is one of
+/// The questions under the root `node` of a FormSet whose prompt, as `tier` takes it, is one of
 /// `possible_question_phrases` in a language of `texts`, as find_question finds them, for
-/// check_prompt_language.
+/// check_prompt_language and the choice of the tier.
 pub(crate) fn prompt_matches<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     possible_question_phrases: &BTreeSet<T>,
+    tier: MatchTier,
 ) -> Vec<PromptMatch>
 where
     T: AsRef<str>,
 {
-    questions_named(node, texts, possible_question_phrases)
+    questions_named(node, texts, possible_question_phrases, tier)
         .into_iter()
         .map(|named| named.prompt)
         .collect()
@@ -3939,7 +4116,7 @@ pub(crate) fn check_address_unique(
                 ListedQuestion::of(&op)
                     .map(|question| texts.display(question.header().prompt_string_id))
             })
-            .map(str::to_owned)
+            .map(Cow::into_owned)
             .collect(),
     })
 }
@@ -4028,22 +4205,29 @@ pub(crate) fn choice_for_set(
     writer: ReadOnlyWriter<'_>,
     reader: &EfivarReader,
 ) -> Result<Choice<QuestionDescriptor>> {
-    let ((descriptor, evaluation), ranked_before) = match &selection {
-        Selection::Picked {
-            picked,
-            ranked_before,
-        } => (picked, *ranked_before),
-        Selection::Undetermined {
-            likely,
-            ranked_before,
-            ..
-        } => (likely, *ranked_before),
-        Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
-    };
     // the WRITE expression of a question without a VarStore names the stores that set writes
-    if let Some(store) = descriptor.store(reader.reach())? {
-        check_writable(store, reader, options.volatile)?;
+    if let Some(((descriptor, _), _)) = selection.written_or_likely() {
+        if let Some(store) = descriptor.store(reader.reach())? {
+            check_writable(store, reader, options.volatile)?;
+        }
     }
+    read_only_choice(selection, question, writer)
+}
+
+/// The choice of Selection::for_set, unless the match that set would write, or the likely match,
+/// is read-only by an EFI_IFR_VALUE, which nothing makes writable: then
+/// ChangeValueError::ReadOnly. A chosen match that EFI_IFR_FLAG_READ_ONLY makes read-only goes to
+/// `writer` after these refusals and those of Selection::for_set. choice_for_set checks the
+/// efivar of the match first; set takes this choice alone for a question whose driver holds its
+/// value, which has none.
+pub(crate) fn read_only_choice(
+    selection: Selection<QuestionDescriptor>,
+    question: &str,
+    writer: ReadOnlyWriter<'_>,
+) -> Result<Choice<QuestionDescriptor>> {
+    let Some(((descriptor, evaluation), ranked_before)) = selection.written_or_likely() else {
+        return Ok(selection.for_set(question)?);
+    };
     let name = descriptor.question.clone();
     match evaluation.read_only() {
         Some(cause @ ReadOnlyCause::ValueExpression) => Err(ChangeValueError::ReadOnly {
@@ -4058,6 +4242,27 @@ pub(crate) fn choice_for_set(
             Ok(choice)
         }
         None => Ok(selection.for_set(question)?),
+    }
+}
+
+/// apply-staged's check of `question`, the one question of a staged request, which `cause` makes
+/// read-only, if anything does, as read_only_choice's of a match that no other ranks before:
+/// ChangeValueError::ReadOnly where an EFI_IFR_VALUE gives its value, and to `writer` where
+/// EFI_IFR_FLAG_READ_ONLY makes it read-only.
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) fn check_staged_read_only(
+    question: String,
+    cause: Option<ReadOnlyCause>,
+    writer: ReadOnlyWriter<'_>,
+) -> std::result::Result<(), ChangeValueError> {
+    match cause {
+        Some(cause @ ReadOnlyCause::ValueExpression) => Err(ChangeValueError::ReadOnly {
+            question,
+            cause,
+            ranked_before: IncludedStates::empty(),
+        }),
+        Some(ReadOnlyCause::Flag) => writer.write_read_only(question, IncludedStates::empty()),
+        None => Ok(()),
     }
 }
 
@@ -4159,13 +4364,14 @@ mod choice_for_set_tests {
     const MISSING_NOT_FOUND: &str = "no EFI variable Missing-00000000-0000-0000-0000-000000000000";
     /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
     const MISSING_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
-        variable Missing-00000000-0000-0000-0000-000000000000>";
-    /// Why the EQ_ID_VAL on question 2, on AMI firmware's buffer VarStore SystemAccess without
-    /// an efivar, is not evaluated.
-    const SYSTEM_ACCESS_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: \
-        no EFI variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore \
-        requires EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level \
-        there (0 Administrator, 1 User); --access-level administrator|user states one>";
+        variable Missing-00000000-0000-0000-0000-000000000000; --assume-var-store \
+        Missing-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>";
+    /// Why the EQ_ID_VAL on question 2, on the buffer VarStore Mode without an efivar, is not
+    /// evaluated.
+    const MODE_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
+        variable Mode-11111111-1111-1111-1111-111111111111; HII buffer varstore requires \
+        EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+        Mode-11111111-1111-1111-1111-111111111111+0=<HEX of 1 byte> states it>";
 
     /// set's choice for PROMPT in the FormSet `root`, where only the efivar Present, of
     /// 1 byte, exists.
@@ -4188,29 +4394,29 @@ mod choice_for_set_tests {
         root: &Rc<RefCell<IFROperation>>,
         efivars: &Efivars,
     ) -> Result<Choice<QuestionDescriptor>> {
-        choice_reading(root, efivars, None)
+        choice_reading(root, efivars, &[])
     }
 
-    /// choice_with, with conditions reading `access_level`, if stated, for SystemAccess instead of
-    /// its value.
+    /// choice_with, with conditions reading the VarStore bytes that `assumed` states.
     fn choice_reading(
         root: &Rc<RefCell<IFROperation>>,
         efivars: &Efivars,
-        access_level: Option<AccessLevel>,
+        assumed: &[AssumedVarStore],
     ) -> Result<Choice<QuestionDescriptor>> {
-        choice_by(root, efivars.reader(), access_level)
+        choice_by(root, efivars.reader(), assumed)
     }
 
     /// choice_reading, with `reader` instead of a reader of efivar files.
     fn choice_by(
         root: &Rc<RefCell<IFROperation>>,
         mut reader: EfivarReader,
-        access_level: Option<AccessLevel>,
+        assumed: &[AssumedVarStore],
     ) -> Result<Choice<QuestionDescriptor>> {
-        let values = VarStoreValues::new(root, access_level);
+        let assumed = check_assumed([root], assumed).expect("check the statements");
+        let values = VarStoreValues::new(root, assumed);
         let selection = find_question_in(
             root,
-            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings(), &[]),
                 &mut reader,
@@ -4302,12 +4508,12 @@ mod choice_for_set_tests {
         );
     }
 
-    /// The FormSet of PROMPT, question 1 on VarStore 1, which AMI firmware grays out for a
-    /// User session: SystemAccess, question 2, being 1.
-    fn grayed_out_for_users() -> Rc<RefCell<IFROperation>> {
+    /// The FormSet of PROMPT, question 1 on VarStore 1, which a GRAY_OUT_IF grays out while
+    /// question 2, at byte 0 of the buffer VarStore Mode, is 1.
+    fn grayed_out_by_mode() -> Rc<RefCell<IFROperation>> {
         parse_form_set(&[
             var_store_efi(1, "Present", NV_BS_RT, 1),
-            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            var_store(2, [0x11; 16], "Mode", 1),
             form(
                 1,
                 &[
@@ -4318,42 +4524,46 @@ mod choice_for_set_tests {
         ])
     }
 
-    /// set's refusal of a question that AMI firmware grays out for a User session names where
-    /// the access level is kept.
+    /// set's refusal of a question that a condition on an unreadable buffer VarStore may gray out
+    /// names the flag that states the byte it reads.
     #[test]
-    fn undetermined_match_on_the_ami_access_level_names_it() {
-        let error = choice_in(&grayed_out_for_users()).expect_err("set refuses question 1");
+    fn undetermined_match_on_a_buffer_var_store_names_the_flag() {
+        let error = choice_in(&grayed_out_by_mode()).expect_err("set refuses question 1");
         assert_eq!(
             error.downcast_ref::<SelectionError>(),
             Some(&SelectionError::Undetermined {
                 question: PROMPT.to_string(),
                 states: IncludedStates::GRAYED_OUT,
-                reasons: vec![SYSTEM_ACCESS_INPUT.to_string()],
+                reasons: vec![MODE_INPUT.to_string()],
             }),
-            "question 1 under a GRAY_OUT_IF on the access level: {error:#}"
+            "question 1 under a GRAY_OUT_IF on Mode: {error:#}"
         );
     }
 
-    /// set chooses a question that AMI firmware grays out for a User session at a stated
-    /// Administrator level, and skips it as grayed out at a stated User level.
+    /// set chooses a question by the VarStore bytes stated: with 00 stated for the byte that its
+    /// GRAY_OUT_IF reads, and skips it as grayed out with 01.
     #[test]
-    fn stated_access_level_decides_the_choice() {
-        let root = grayed_out_for_users();
+    fn stated_var_store_bytes_decide_the_choice() {
+        let root = grayed_out_by_mode();
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Present", 1), &[0]);
+        let stated = |text: &str| {
+            let assumed: AssumedVarStore = text.parse().expect("a statement");
+            choice_reading(&root, &efivars, &[assumed])
+        };
 
-        let administrator = choice_reading(&root, &efivars, Some(AccessLevel::Administrator));
+        let selectable = stated("Mode-11111111-1111-1111-1111-111111111111=00");
         assert!(
-            matches!(administrator, Ok(Choice::Chosen(..))),
-            "Administrator: {administrator:?}"
+            matches!(selectable, Ok(Choice::Chosen(..))),
+            "00 stated: {selectable:?}"
         );
-        let user = choice_reading(&root, &efivars, Some(AccessLevel::User));
+        let grayed_out = stated("Mode-11111111-1111-1111-1111-111111111111=01");
         assert!(
             matches!(
-                user,
+                grayed_out,
                 Ok(Choice::Skipped(exclusion)) if exclusion.states == IncludedStates::GRAYED_OUT
             ),
-            "User: {user:?}"
+            "01 stated: {grayed_out:?}"
         );
     }
 
@@ -4505,7 +4715,7 @@ mod choice_for_set_tests {
             let variables = Rc::new(MemoryVariables::new(reach, interface));
             variables.insert(variable_key("Present"), NV_BS, &[0]);
             let reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
-            (choice_by(&root, reader, None), variables.reads())
+            (choice_by(&root, reader, &[]), variables.reads())
         };
 
         let (choice, reads) = choose(
@@ -4547,11 +4757,7 @@ mod choice_for_set_tests {
                 VariableInterface::FirmwareEnvironment,
             );
             variables.insert(variable_key("Present"), attributes, &[0]);
-            choice_by(
-                root,
-                EfivarReader::with_variables(Box::new(variables)),
-                None,
-            )
+            choice_by(root, EfivarReader::with_variables(Box::new(variables)), &[])
         };
         let refusal = |choice: Result<Choice<QuestionDescriptor>>| {
             choice.map_err(|error| error.to_string()).err()
@@ -4639,7 +4845,7 @@ mod choice_for_set_tests {
             let read = read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut reader)
                 .map(<[u8]>::to_vec)
                 .map_err(|reason| reason.to_answer());
-            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+            let error = choice_by(&root, reader, &[]).expect_err("set refuses the ONE_OF");
 
             let not_exported = error
                 .downcast_ref::<VariableNotExported>()
@@ -4690,7 +4896,7 @@ mod choice_for_set_tests {
         for (reach, interface, refusal) in cases {
             let reader =
                 EfivarReader::with_variables(Box::new(MemoryVariables::new(reach, interface)));
-            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+            let error = choice_by(&root, reader, &[]).expect_err("set refuses the ONE_OF");
 
             let text = error.to_string();
             assert!(
@@ -4721,7 +4927,7 @@ mod choice_for_set_tests {
                 let choice = choice_by(
                     &root,
                     EfivarReader::with_variables(Box::new(variables)),
-                    None,
+                    &[],
                 );
 
                 let chosen = matches!(choice, Ok(Choice::Chosen(..)));
@@ -4776,7 +4982,7 @@ mod choice_for_set_tests {
             let read = read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut reader)
                 .map(<[u8]>::to_vec)
                 .map_err(|reason| reason.to_answer());
-            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+            let error = choice_by(&root, reader, &[]).expect_err("set refuses the ONE_OF");
 
             match reach {
                 VariableReach::Runtime => {
@@ -4836,7 +5042,7 @@ mod choice_for_set_tests {
                 let reader = EfivarReader::with_variables(Box::new(variables));
 
                 let error =
-                    choice_by(&root, reader, None).expect_err("set refuses a volatile efivar");
+                    choice_by(&root, reader, &[]).expect_err("set refuses a volatile efivar");
 
                 assert_eq!(
                     error.to_string(),
@@ -4921,7 +5127,7 @@ pub(crate) fn display(
     reader: &mut EfivarReader,
 ) -> Result<TextLines> {
     let mut lines = Vec::new();
-    let values = VarStoreValues::new(&node, None);
+    let values = VarStoreValues::new(&node, CheckedVarStores::NONE);
     let mut inputs = ExpressionInputs {
         reader,
         values: &values,
@@ -5352,14 +5558,9 @@ fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Result<Opti
             "VarStore {var_store_id:#06x} is declared in the scope of a DISABLE_IF of its FormSet \
              whose condition is not known: {reason}"
         )),
-        Creation::Undetermined(Undetermined::Hiding(hiding)) => Err(anyhow!(
-            "VarStore {var_store_id:#06x} follows an {} in the scope of a DISABLE_IF of its \
-             FormSet, whose condition is {}: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes \
-             that condition for the DISABLE_IF's, which may skip the rest of its scope \
-             (:1690-1704, :3045-3059), where UEFI 2.11 §33.3.8.3.75 has it only hide",
-            hiding.op,
-            hiding.condition()
-        )),
+        Creation::Undetermined(Undetermined::Hiding(hiding)) => {
+            Err(anyhow!("VarStore {var_store_id:#06x} follows {hiding}"))
+        }
     }
 }
 
@@ -5474,34 +5675,46 @@ fn decoded_store(op: &IFROperation) -> Result<Option<(u16, DeclaredStore)>> {
     Ok(decode_var_store(op)?.and_then(|parsed| declared_store(&parsed)))
 }
 
-/// Whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes creates the store of a
-/// VarStore op of a form-set-list (CreateStorage, :1873-1913); form_set_list_var_stores never meets
-/// one that it skips.
+/// Whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes parses an op of a
+/// form-set-list, as it creates the store of a VarStore op (CreateStorage, :1873-1913);
+/// form_set_list_ops never meets one that it skips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Creation {
     Created,
     Undetermined(Undetermined),
 }
 
-/// Why ParseOpCodes may skip a VarStore op of a form-set-list.
+/// Why ParseOpCodes may skip an op of a form-set-list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Undetermined {
     /// In the scope of a DISABLE_IF whose condition is not known: why
     DisableIf(Rc<str>),
-    /// After a SUPPRESS_IF or GRAY_OUT_IF in the scope of a DISABLE_IF, whose condition is TRUE or
-    /// not known
+    /// After an op of hiding_role in the scope of a DISABLE_IF, whose condition is TRUE or not
+    /// known
     Hiding(Hiding),
 }
 
-/// A SUPPRESS_IF or GRAY_OUT_IF of a form-set-list in the scope of a DISABLE_IF, whose condition
+/// An op of hiding_role of a form-set-list in the scope of a DISABLE_IF, whose condition
 /// ParseOpCodes takes for the DISABLE_IF's (:1690-1704, :3045-3059): TRUE skips the rest of that
 /// DISABLE_IF's scope (:1390-1413).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hiding {
     /// Its spec name
     op: &'static str,
+    /// What UEFI 2.11 has it do instead
+    role: &'static str,
     /// Why its condition is not known; None if it is TRUE
     unknown: Option<Rc<str>>,
+}
+
+impl Undetermined {
+    /// Why ParseOpCodes may skip an op that this leaves undetermined, for a question there.
+    fn reason(&self) -> String {
+        match self {
+            Undetermined::DisableIf(reason) => reason.to_string(),
+            Undetermined::Hiding(hiding) => format!("it is after {hiding}"),
+        }
+    }
 }
 
 impl Hiding {
@@ -5514,19 +5727,37 @@ impl Hiding {
     }
 }
 
-/// The scopes around an op of a form-set-list, as form_set_list_var_stores walks them.
+impl fmt::Display for Hiding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "an {} in the scope of a DISABLE_IF of its FormSet, whose condition is {}: \
+             edk2-stable202608 SetupBrowserDxe/IfrParse.c takes that condition for the \
+             DISABLE_IF's, which may skip the rest of its scope (:1690-1704, :3045-3059), where \
+             UEFI 2.11 {}",
+            self.op,
+            self.condition(),
+            self.role
+        )
+    }
+}
+
+/// The scopes around an op of a form-set-list, as form_set_list_ops walks them.
 #[derive(Clone, Default)]
 struct ListScopes {
     /// Why the first DISABLE_IF around, outermost first, whose condition is not known, may skip it
     unknown_disable_if: Option<Rc<str>>,
-    /// In the scope of a DISABLE_IF: the first SUPPRESS_IF or GRAY_OUT_IF met so far in the scope
-    /// of the outermost one whose condition is TRUE or not known, shared by every op in that scope
+    /// In the scope of a DISABLE_IF: the first op of hiding_role whose condition is TRUE or not
+    /// known met so far in its scope before any DISABLE_IF ends there, or in those around it
+    /// before it, shared by every op in its scope but those in DISABLE_IFs that it nests:
+    /// ParseOpCodes skips to the END of the innermost DISABLE_IF around, counting those nested in
+    /// it (:1395-1410)
     hiding: Option<Rc<RefCell<Option<Hiding>>>>,
 }
 
 impl ListScopes {
-    /// Whether ParseOpCodes creates the store of a VarStore op in these scopes: the DISABLE_IFs
-    /// first, then the SUPPRESS_IFs and GRAY_OUT_IFs.
+    /// Whether ParseOpCodes parses an op in these scopes: the DISABLE_IFs first, then the ops of
+    /// hiding_role.
     fn creation(&self) -> Creation {
         let hiding = self
             .hiding
@@ -5541,39 +5772,82 @@ impl ListScopes {
 }
 
 /// Visits the VarStore ops in the form-set-list of `form_set` (UEFI 2.11 §33.2.5.1), where
-/// VfrCompile declares VarStores, in IFR order, each with whether edk2-stable202608
-/// SetupBrowserDxe/IfrParse.c ParseOpCodes creates its store and the FORMs and FORM_MAPs before
-/// it, until `visit` gives Some. It meets none in the scope of a FORM or FORM_MAP, outside the
-/// form-set-list, nor of an unknown op (IsUnKnownOpCode), nor of a DISABLE_IF whose condition is
-/// TRUE, which ParseOpCodes skips whatever DISABLE_IFs it nests (:1390-1413). It evaluates each
-/// DISABLE_IF, SUPPRESS_IF and GRAY_OUT_IF of the form-set-list once, the latter only in the scope
-/// of a DISABLE_IF.
+/// VfrCompile declares VarStores, as form_set_list_ops meets them, until `visit` gives Some.
 fn form_set_list_var_stores<T>(
     form_set: &IFROperation,
     mut visit: impl FnMut(&IFROperation, &Creation, &[Rc<RefCell<IFROperation>>]) -> Option<T>,
 ) -> Option<T> {
+    form_set_list_ops(form_set, |node, creation, forms| {
+        let op = node.borrow();
+        let var_store = matches!(
+            op.op_code,
+            IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue
+        );
+        var_store.then(|| visit(&op, creation, forms)).flatten()
+    })
+}
+
+/// The ops of the form-set-list of `form_set` and its FORMs and FORM_MAPs, each with whether
+/// ParseOpCodes parses it, with its scope, as form_set_list_ops meets them; it skips the others.
+fn list_creations(form_set: &IFROperation) -> Vec<(Rc<RefCell<IFROperation>>, Creation)> {
+    let mut met = Vec::new();
+    form_set_list_ops(form_set, |node, creation, _| -> Option<Infallible> {
+        met.push((Rc::clone(node), creation.clone()));
+        None
+    });
+    met
+}
+
+/// Visits the ops in the form-set-list of `form_set` and its FORMs and FORM_MAPs, in IFR order,
+/// each with whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes parses it, as it
+/// creates the store of a VarStore op, and the FORMs and FORM_MAPs before it, until `visit` gives
+/// Some. It meets none in the scope of a FORM or FORM_MAP, outside the form-set-list, nor of an
+/// unknown op (IsUnKnownOpCode), nor of a DISABLE_IF whose condition is TRUE, which ParseOpCodes
+/// skips whatever DISABLE_IFs it nests (:1390-1413). It evaluates each DISABLE_IF and each op of
+/// hiding_role of the form-set-list once, the latter only in the scope of a DISABLE_IF.
+fn form_set_list_ops<T>(
+    form_set: &IFROperation,
+    mut visit: impl FnMut(
+        &Rc<RefCell<IFROperation>>,
+        &Creation,
+        &[Rc<RefCell<IFROperation>>],
+    ) -> Option<T>,
+) -> Option<T> {
     let mut forms = Vec::new();
+    // the hiding of the DISABLE_IF met last, None after one that ParseOpCodes leaves before the
+    // next op: it takes a condition for a DISABLE_IF's only until the END of any DISABLE_IF, in a
+    // FORM too (:2654-2655, :3007-3014)
+    let mut open_hiding: Option<Rc<RefCell<Option<Hiding>>>> = None;
     let walked = try_walk_scopes(&form_set.children, ListScopes::default(), |node, scopes| {
         let op = node.borrow();
         if skips_scope(&op) {
             return Ok(Walk::Skip);
         }
+        if let Some(found) = visit(node, &scopes.creation(), &forms) {
+            return Err(found);
+        }
         match op.op_code {
-            IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
-                match visit(&op, &scopes.creation(), &forms) {
-                    Some(found) => Err(found),
-                    None => Ok(Walk::Enter(scopes.clone())),
-                }
-            }
             IFROpCode::Form | IFROpCode::FormMap => {
                 forms.push(Rc::clone(node));
+                if holds_disable_if(node) {
+                    open_hiding = None;
+                }
                 Ok(Walk::Skip)
             }
             IFROpCode::DisableIf => {
                 let mut inner = scopes.clone();
-                inner.hiding.get_or_insert_with(Rc::default);
+                let start = scopes
+                    .hiding
+                    .as_ref()
+                    .and_then(|hiding| hiding.borrow().clone());
+                let hiding = Rc::new(RefCell::new(start));
+                open_hiding = Some(Rc::clone(&hiding));
+                inner.hiding = Some(hiding);
                 match constant_condition(&op) {
-                    Truth::Known(true) => return Ok(Walk::Skip),
+                    Truth::Known(true) => {
+                        open_hiding = None;
+                        return Ok(Walk::Skip);
+                    }
                     Truth::Known(false) => {}
                     Truth::Unknown(reason) => {
                         inner.unknown_disable_if.get_or_insert(reason.into());
@@ -5581,8 +5855,13 @@ fn form_set_list_var_stores<T>(
                 }
                 Ok(Walk::Enter(inner))
             }
-            IFROpCode::SuppressIf | IFROpCode::GrayOutIf => {
-                if let Some(hiding) = &scopes.hiding {
+            code => {
+                let open = scopes.hiding.as_ref().filter(|hiding| {
+                    open_hiding
+                        .as_ref()
+                        .is_some_and(|open| Rc::ptr_eq(open, hiding))
+                });
+                if let (Some(hiding), Some(role)) = (open, hiding_role(code)) {
                     let unknown = match constant_condition(&op) {
                         Truth::Known(true) => Some(None),
                         Truth::Known(false) => None,
@@ -5591,16 +5870,51 @@ fn form_set_list_var_stores<T>(
                     if let Some(unknown) = unknown {
                         hiding.borrow_mut().get_or_insert(Hiding {
                             op: op.op_code.spec_name(),
+                            role,
                             unknown,
                         });
                     }
                 }
                 Ok(Walk::Enter(scopes.clone()))
             }
-            _ => Ok(Walk::Enter(scopes.clone())),
         }
     });
     walked.err()
+}
+
+/// Whether ParseOpCodes meets a DISABLE_IF in the scope of `form`, outside an unknown op's.
+fn holds_disable_if(form: &Rc<RefCell<IFROperation>>) -> bool {
+    let mut held = false;
+    walk_scopes(&form.borrow().children, (), |node, ()| {
+        let op = node.borrow();
+        held |= op.op_code == IFROpCode::DisableIf;
+        if skips_scope(&op) {
+            Walk::Skip
+        } else {
+            Walk::Enter(())
+        }
+    });
+    held
+}
+
+/// What UEFI 2.11 has `code` do, if ParseOpCodes opens an expression for an op of it outside
+/// forms, which it takes for the condition of the DISABLE_IF around (:1690-1704, :3045-3059):
+/// edk2-stable202608 IfrParse.c opens one for NO_SUBMIT_IF and INCONSISTENT_IF at :2515,
+/// WARNING_IF at :2548, SUPPRESS_IF at :2574, GRAY_OUT_IF at :2609, VALUE at :2670, RULE at
+/// :2713, READ at :2736 and WRITE at :2767.
+fn hiding_role(code: IFROpCode) -> Option<&'static str> {
+    match code {
+        IFROpCode::SuppressIf => Some("§33.3.8.3.75 has it only hide"),
+        IFROpCode::GrayOutIf => Some("§33.3.8.3.28 has it only gray out"),
+        IFROpCode::Value => Some("§33.3.8.3.88 has it only give a value"),
+        IFROpCode::Read => Some("§33.3.8.3.58 has it only give a value"),
+        IFROpCode::Write => Some("§33.3.8.3.94 has it only change a value"),
+        IFROpCode::Rule => Some("§33.3.8.3.63 has it only name a rule"),
+        IFROpCode::InconsistentIf => Some("§33.3.8.3.33 has it only validate a question"),
+        IFROpCode::NoSubmitIf => Some("§33.3.8.3.46 has it only validate a question"),
+        IFROpCode::WarningIf => Some("§33.3.8.3.96 has it only validate a question"),
+        _ => None,
+    }
 }
 
 /// Fills the VarName strings of the VARSTORE_EFIs before UEFI 2.3.1 of the FormSets of `roots`,
@@ -5761,7 +6075,7 @@ mod tests {
                 root,
                 &ListTexts::new(&[], &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut Efivars::new().reader(),
             );
 
@@ -5783,12 +6097,12 @@ mod tests {
     #[test]
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let prompted = |prompt: &str| vec![en_us_package(StringMap::from([(3, prompt.into())]))];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
-                &QuestionMatch::Prompt(&BTreeSet::from([phrase])),
+                &QuestionMatch::Prompt(&BTreeSet::from([phrase]), MatchTier::Stored),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&prompted(prompt), &[]),
                     &mut Efivars::new().reader(),
@@ -5802,7 +6116,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&prompted("  Prompt "), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
         let name = &listed[0].0.question;
@@ -6591,7 +6905,7 @@ mod tests {
                 root,
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut disabled_reader(),
             );
 
@@ -6855,7 +7169,7 @@ mod nesting_tests {
         on_small_stack("VarStoreValues::new", || {
             let root = parse_deep(DEEP, DEEP, false);
             let deep = op_like(&root, &deep_checkbox());
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             let mut reader = disabled_reader();
             for (id, indexed) in [(1, true), (9, false)] {
                 assert_eq!(
@@ -6877,7 +7191,7 @@ mod nesting_tests {
                     parse_deep(DEEP, DEEP, false),
                     &ListTexts::new(&deep_strings(), &[]),
                     include,
-                    None,
+                    CheckedVarStores::NONE,
                     &mut disabled_reader(),
                 );
                 let names: Vec<String> = listed
@@ -6893,9 +7207,9 @@ mod nesting_tests {
                 let selection = find_question(
                     parse_deep(DEEP, DEEP, false),
                     &ListTexts::new(&deep_strings(), &[]),
-                    &QuestionMatch::Prompt(&BTreeSet::from([name])),
+                    &QuestionMatch::Prompt(&BTreeSet::from([name]), MatchTier::Stored),
                     IncludedStates::GRAYED_OUT,
-                    None,
+                    CheckedVarStores::NONE,
                     &mut disabled_reader(),
                 );
                 assert_eq!(
@@ -6944,7 +7258,7 @@ mod nesting_tests {
                     .as_ref()
                     .and_then(Weak::upgrade)
                     .expect("the SUPPRESS_IF");
-                let values = VarStoreValues::new(&root, None);
+                let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let mut reader = disabled_reader();
                 let mut inputs = ExpressionInputs {
                     reader: &mut reader,

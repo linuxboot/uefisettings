@@ -89,6 +89,10 @@ uefisettings.efi hii get --help
 echo uefisettings-shell: step hii-get-help %lasterror%
 uefisettings.efi hii set --help
 echo uefisettings-shell: step hii-set-help %lasterror%
+uefisettings.efi --hii-source efivar hii list-strings
+echo uefisettings-shell: step hii-source-refused %lasterror%
+uefisettings.efi hii list-strings --efivar-memory runtime
+echo uefisettings-shell: step efivar-memory-refused %lasterror%
 uefisettings.efi hii keyword get --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable"
 echo uefisettings-shell: step keyword-get %lasterror%
 uefisettings.efi hii keyword get --namespace x-UEFI-ns KEYWORD=iSCSIBootEnable

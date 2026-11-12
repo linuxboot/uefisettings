@@ -12,10 +12,10 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # Checks that the Rust toolchain of the checks is there, and installs nothing. With a
-# toolchain name, the cargo on PATH must be the one of rustup, and rustup must have that
-# toolchain, a release toolchain for its default host, with clippy, rustfmt and every target
-# of the list; with an empty name, PATH must have a cargo. Each missing piece has its own
-# message.
+# toolchain name, rustup must have that toolchain, a release toolchain for its default
+# host, with clippy, rustfmt and every target of the list, and the cargo on PATH must run
+# the cargo of that toolchain, as the cargo of rustup does; with an empty name, PATH must
+# have a cargo. Each missing piece has its own message.
 #
 # Usage: scripts/check-toolchain.sh <toolchain name, or empty> <target>[,<target>...]
 
@@ -52,17 +52,12 @@ if ! command -v rustup >/dev/null; then
     exit 1
 fi
 
-# The cargo of rustup is a link to rustup itself, which runs the cargo of the toolchain;
-# another cargo would ignore the toolchain.
+# Whether this cargo runs the cargo of the toolchain is checked once rustup has the
+# toolchain, below.
 cargo=$(command -v cargo || true)
 if [[ -z $cargo ]]; then
     echo "the checks run Rust $toolchain through the cargo of rustup," \
         "and PATH has no cargo" >&2
-    exit 1
-fi
-if [[ ! $cargo -ef $(command -v rustup) ]]; then
-    echo "the checks run Rust $toolchain through the cargo of rustup, and the cargo on" \
-        "PATH, $cargo, is another one; make RUST_TOOLCHAIN= runs them on that cargo" >&2
     exit 1
 fi
 
@@ -105,6 +100,26 @@ if ! grep --quiet --line-regexp --fixed-strings "rustc-$host" <<<"$listed_compon
     echo "Rust toolchain $toolchain has no rustc for $host, the default host of rustup," \
         "and the checks take a toolchain for that host; make RUST_TOOLCHAIN= runs them" \
         "on the cargo on PATH" >&2
+    exit 1
+fi
+
+# The cargo of rustup runs the cargo of the toolchain that RUSTUP_TOOLCHAIN names, whatever
+# file it is: a link to rustup, a copy of it, or a script that runs it, as Homebrew installs
+# it. Another cargo ignores RUSTUP_TOOLCHAIN and prints its own version. rustup run runs the
+# cargo of the toolchain itself; -- hands rustup a name that starts with - as the toolchain.
+if ! toolchain_cargo=$(rustup run -- "$toolchain" cargo --version 2>&1); then
+    echo "rustup cannot run the cargo of Rust $toolchain; rustup run prints:" >&2
+    printf '%s\n' "$toolchain_cargo" >&2
+    exit 1
+fi
+path_cargo=$(RUSTUP_TOOLCHAIN=$toolchain "$cargo" --version 2>&1 || true)
+if [[ $path_cargo != "$toolchain_cargo" ]]; then
+    echo "the checks run Rust $toolchain through the cargo of rustup, and the cargo on" \
+        "PATH, $cargo, runs another one; make RUST_TOOLCHAIN= runs them on that cargo." \
+        "With RUSTUP_TOOLCHAIN=$toolchain it prints:" >&2
+    printf '%s\n' "$path_cargo" >&2
+    echo "and the cargo of Rust $toolchain prints:" >&2
+    printf '%s\n' "$toolchain_cargo" >&2
     exit 1
 fi
 

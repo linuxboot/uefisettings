@@ -1,5 +1,6 @@
-# The checks of the Makefile; the QEMU boots, which need KVM and apt packages, and
-# the unit tests on macOS and Windows in jobs of their own.
+# The checks of the Makefile in a job per kind: lint, which reads the source of every system on
+# one host, and the unit tests and the QEMU tests, which run make -k <check> for each system in
+# a matrix entry named after its operating system and architecture.
 name: ci
 
 on:
@@ -17,8 +18,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The image of test-e2e-qemu too: one image, one migration.
-  lint-and-test:
+  # The Ubuntu release of the other Linux jobs too, ubuntu-26.04-arm on arm64: one release, one migration.
+  lint:
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -26,48 +27,46 @@ jobs:
         with:
           persist-credentials: false
 
-      # gcc's 32-bit libraries, which test-i686 links with.
-      - run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-multilib
-
       - run: make setup
 
       # After setup: the key covers installed toolchains.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # Every check but the boots.
-      - run: make -k lint test test-i686
+      - run: make -k lint
 
-  # The unit tests of the macOS build on both of its targets; lint-and-test lints them.
-  test-macos:
+  # The unit tests of each system on a runner of that system: test runs those of the host's
+  # build, and test-i686 those of the 32-bit glibc build on x86_64 Linux. The Windows build's
+  # firmware calls run against fakes.
+  test:
+    name: test (${{ matrix.system }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-latest, macos-15-intel]
+        include:
+          - system: linux-x86_64
+            runner: ubuntu-26.04
+            check: test
+          - system: linux-i686
+            runner: ubuntu-26.04
+            check: test-i686
+          - system: linux-aarch64
+            runner: ubuntu-26.04-arm
+            check: test
+          - system: macos-aarch64
+            runner: macos-26
+            check: test
+          - system: macos-x86_64
+            runner: macos-15-intel
+            check: test
+          - system: windows-x86_64
+            runner: windows-2025
+            check: test
+          - system: windows-aarch64
+            runner: windows-11-arm
+            check: test
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # GNU make 4 as gmake: Apple's make 3.81 ignores the Makefile's .SHELLFLAGS (3.82).
-      - run: brew install make
-
-      - run: gmake setup
-
-      # After setup: the key covers installed toolchains.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - run: gmake -k test
-
-  # The unit tests of the Windows build on x86_64, whose firmware calls run against
-  # fakes; lint-and-test lints both of its targets.
-  test-windows:
-    runs-on: windows-2025
-    timeout-minutes: 60
-    # Git for Windows' bash, which the Makefile's recipes and scripts need.
+    # Git for Windows' bash on Windows, which the Makefile's recipes and scripts need.
     defaults:
       run:
         shell: bash
@@ -76,19 +75,56 @@ jobs:
         with:
           persist-credentials: false
 
+      # gcc's 32-bit libraries, which test-i686 links with.
+      - if: matrix.check == 'test-i686'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib
+
+      # GNU make 4, ahead of Apple's make 3.81 on PATH, which ignores the Makefile's
+      # .SHELLFLAGS (3.82).
+      - if: runner.os == 'macOS'
+        run: |
+          brew install make
+          echo "$(brew --prefix make)/libexec/gnubin" >>"$GITHUB_PATH"
+
       # GNU make, which the image lacks.
-      - run: choco install make --yes --no-progress
+      - if: runner.os == 'Windows'
+        run: choco install make --yes --no-progress
 
       - run: make setup
 
-      # After setup: the key covers installed toolchains.
+      # After setup: the key covers installed toolchains. The system tells apart the entries
+      # of one runner image.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.system }}
 
-      - run: make -k test
+      - run: make -k "$CHECK"
+        env:
+          CHECK: ${{ matrix.check }}
 
+  # Each system that the QEMU tests boot, Linux or the UEFI Shell, on each architecture.
   # QEMU 9.0 and newer fault unaligned loads from Device memory as arm64 does, which the
   # aarch64 guests check; Ubuntu 24.04 has QEMU 8.2.
   test-e2e-qemu:
+    name: test-e2e-qemu (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: linux-x86_64
+            check: test-e2e-qemu-x86_64
+          - system: linux-i686
+            check: test-e2e-qemu-i686
+          - system: linux-aarch64
+            check: test-e2e-qemu-aarch64
+          - system: uefi-shell-x86_64
+            check: test-e2e-qemu-shell-x86_64
+          - system: uefi-shell-i686
+            check: test-e2e-qemu-shell-i686
+          - system: uefi-shell-aarch64
+            check: test-e2e-qemu-shell-aarch64
     runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
@@ -109,27 +145,31 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       # No rust-cache: its cleanup takes run.sh's initramfs/tests for a cargo
-      # profile and logs errors; the builds take about a minute without it.
+      # profile and logs errors; the builds take about 2.5 minutes without it.
       - run: make setup
 
-      # The guests' packages, each architecture's DriverSample.efi and Secure Boot firmware,
-      # keyed also on the apt packages, the pinned iasl and the runner image (this file) that
-      # build them. Saved only on success, as run.sh reuses DriverSample.efi and the firmware
-      # unchecked.
+      # The system's guest packages, DriverSample.efi and Secure Boot firmware, keyed also on
+      # the apt packages, the pinned iasl and the runner image (this file) that build them. Per
+      # system, not per architecture: the Linux scenarios also boot the guests of
+      # guest-packages-<arch>-unfixed*, which a key that the UEFI Shell entry saved first would
+      # lack until the key changes. Saved only on success, as run.sh reuses DriverSample.efi and
+      # the firmware unchecked.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/qemu-test/packages
             target/qemu-test/*/driver-sample
             target/qemu-test/*/secboot-firmware
-          key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh', 'tests/qemu/build-secboot-firmware.sh', 'tests/qemu/host-packages', 'tests/qemu/ubuntu-packages', '.github/workflows/checks.yml') }}
+          key: qemu-inputs-${{ matrix.system }}-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh', 'tests/qemu/build-secboot-firmware.sh', 'tests/qemu/host-packages', 'tests/qemu/ubuntu-packages', '.github/workflows/checks.yml') }}
 
-      - run: make -k test-e2e-qemu
+      - run: make -k "$CHECK"
+        env:
+          CHECK: ${{ matrix.check }}
 
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: qemu-test-logs
+          name: qemu-test-logs-${{ matrix.system }}
           path: |
             target/qemu-test/*/*/*/*.log
             target/qemu-test/*/*/executables

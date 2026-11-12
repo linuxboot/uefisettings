@@ -34,6 +34,7 @@ use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
 use super::CapsuleBackend;
+use super::DriverHeldValues;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
 use super::LiftedOperations;
@@ -61,6 +62,9 @@ use crate::firmware_width::FirmwareWidth;
 use crate::firmware_width::FW_PLATFORM_SIZE_PATH;
 use crate::hii::extract;
 use crate::hii::extract::HiiSourceOptions;
+use crate::hii::forms::IncludedStates;
+use crate::hii::forms::PasswordQuestions;
+use crate::hii::package;
 #[cfg(configuration_tables)]
 use crate::hii::system_vendor_table;
 use crate::hii::EfivarDump;
@@ -77,6 +81,7 @@ use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
 use crate::ilorest::requests::IloDevice;
 use crate::ilorest::requests::RedfishAttributes;
+use crate::staged_set::next_boot::NextBootStaging;
 use crate::translation::ilo::get_qa_variations_ilo;
 use crate::translation::ilo::IloTranslation;
 use crate::translation::translate_response;
@@ -199,10 +204,20 @@ impl HiiBackend {
         source: &HiiSourceOptions,
         unsafe_operations: UnsafeOperations,
     ) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
-        match SavedDump::read_given_hiidb(filename, efivars)? {
+        match Self::read_given_hiidb(filename, efivars)? {
             Some(db) => Ok((db, Vec::new())),
             None => extract::extract_db_from(source, unsafe_operations),
         }
+    }
+
+    /// The HiiDB that read_hiidb reads without this machine: the file `filename` if given, else
+    /// the one that an efivars dump in `efivars` saved; None if neither gives one. A redacted dump
+    /// refuses another `filename`, as in read_hiidb.
+    pub fn read_given_hiidb(
+        filename: Option<&Path>,
+        efivars: &EfivarSource,
+    ) -> Result<Option<Vec<u8>>> {
+        SavedDump::read_given_hiidb(filename, efivars)
     }
 
     /// set_using, in this machine's HiiDB read as `source` says, firmware-reserved memory only if
@@ -580,4 +595,35 @@ fn compare_redfish_attributes(
         }
     }
     map
+}
+
+/// What get and set do with a question whose driver holds its value: get reaches no driver here,
+/// and shows what the records of staged sets tell of it, which this machine's EFI variables hold;
+/// set stages it for the next boot.
+impl HiiBackend {
+    pub(super) fn driver_held_values(
+        _hiidb: &[u8],
+        efivars: &EfivarSource,
+    ) -> Option<Box<dyn DriverHeldValues>> {
+        match efivars {
+            EfivarSource::System => Some(Box::new(NextBootStaging {
+                image: None,
+                esp: None,
+                include: IncludedStates::empty(),
+                assume_var_stores: Vec::new(),
+                unsafe_operations: UnsafeOperations::Refuse,
+                // get writes nothing
+                passwords: PasswordQuestions::default(),
+            })),
+            EfivarSource::Directory(_) | EfivarSource::Disabled => None,
+        }
+    }
+
+    pub(super) fn driver_held_setter(
+        hiidb: &[u8],
+        options: &SetOptions,
+    ) -> Result<Option<Box<dyn DriverHeldValues>>> {
+        let lists = package::read_db(hiidb)?;
+        Ok(Some(Box::new(NextBootStaging::of(options, &lists))))
+    }
 }

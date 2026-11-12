@@ -23,7 +23,13 @@
 //! [`name_value_password_forms`] and the `<ConfigResp>` of their VARSTORE_NAME_VALUE, which holds
 //! the value of the name that their PASSWORD is on. `export-config-storageless-password` does it
 //! with those of [`storageless_password_forms`] and the `<ConfigResp>` of their VARSTORE
-//! SlBacking, whose bytes stand for a password that their PASSWORDs of VarStoreId 0 keep there.
+//! SlBacking, whose bytes stand for a password that their PASSWORDs of VarStoreId 0 keep there,
+//! and `export-config-undeclared-password` with those of [`undeclared_password_forms`] and the
+//! `<ConfigResp>` of their VARSTORE UdBacking, whose bytes stand for a password that the driver of
+//! their PASSWORD of an undeclared VarStoreId keeps there.
+//! `export-config-name-value-string` does the same with the package list of
+//! [`name_value_string_forms`] and the `<ConfigResp>` of its VARSTORE_NAME_VALUE, which holds the
+//! settings of its STRINGs and its CHECKBOX.
 
 use alloc::format;
 use alloc::string::String;
@@ -44,11 +50,15 @@ use uefi_raw::protocol::hii::config::HiiConfigRoutingProtocol;
 
 use crate::install_device_path;
 use crate::name_value_password_forms;
+use crate::name_value_string_forms;
 use crate::password_forms;
 use crate::register_name_value_password_forms;
+use crate::register_name_value_string_forms;
 use crate::register_package_list_for;
 use crate::register_storageless_password_forms;
+use crate::register_undeclared_password_forms;
 use crate::storageless_password_forms;
+use crate::undeclared_password_forms;
 use crate::vendor_device_path;
 use crate::Failure;
 
@@ -97,6 +107,25 @@ pub(crate) fn export_name_value_config() -> Result<(), Failure> {
 pub(crate) fn export_storageless_config() -> Result<(), Failure> {
     register_storageless_password_forms()?;
     export_config_with(&storageless_password_forms::backing_resp(), "SlBacking")
+}
+
+/// Registers the package lists of [`undeclared_password_forms`] for a handle of their device
+/// path, then installs ExportConfig()'s results with the `<ConfigResp>` of their VARSTORE
+/// UdBacking after them, and logs where.
+pub(crate) fn export_undeclared_config() -> Result<(), Failure> {
+    register_undeclared_password_forms()?;
+    export_config_with(&undeclared_password_forms::backing_resp(), "UdBacking")
+}
+
+/// Registers the package list of [`name_value_string_forms`] for a handle of its device path,
+/// then installs ExportConfig()'s results with the `<ConfigResp>` of its VARSTORE_NAME_VALUE
+/// after them, and logs where.
+pub(crate) fn export_name_value_string_config() -> Result<(), Failure> {
+    register_name_value_string_forms()?;
+    export_config_with(
+        &name_value_string_forms::settings_resp(),
+        "the VARSTORE_NAME_VALUE of the STRINGs",
+    )
 }
 
 /// Installs ExportConfig()'s results with `resp`, the `<ConfigResp>` of `storage`, after them,

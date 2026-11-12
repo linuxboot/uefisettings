@@ -18,13 +18,21 @@ pub(crate) mod config_snapshot;
     not(test),
     expect(
         dead_code,
-        reason = "no Config Routing caller builds or parses these strings yet, and only the UEFI \
-                  Shell build's Keyword Handler caller does some"
+        reason = "only the UEFI Shell build routes <ConfigRequest>s and calls the Keyword Handler \
+                  with these strings"
     )
 )]
 mod config_string;
+// EFI_HII_CONFIG_ACCESS_PROTOCOL of a package list's driver, whose Callback() question_callbacks
+// runs.
 #[cfg(target_os = "uefi")]
-mod database_protocol;
+pub(crate) mod config_access;
+// The Buffer and Name/Value stores of a FormSet, which only the UEFI Shell build reaches; the
+// tests run on every host with variables.
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) mod config_routing;
+#[cfg(target_os = "uefi")]
+pub(crate) mod database_protocol;
 #[cfg(efivar_dumps)]
 mod efivar_dump;
 #[cfg(target_os = "linux")]
@@ -41,6 +49,8 @@ mod firmware_environment;
 // parses arm64's EFI memory map with.
 #[cfg(target_os = "linux")]
 pub(crate) mod firmware_memory;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) mod form_set_stores;
 pub mod forms;
 #[cfg(any(target_os = "windows", test))]
 mod hiidb_driver;
@@ -57,6 +67,10 @@ mod lockdown;
 #[cfg(target_os = "linux")]
 mod memory_access_denied;
 pub mod package;
+// Callback() of the driver of a question without a VarStore, which only the UEFI Shell build
+// calls; the tests run on every host that lists variables.
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+pub(crate) mod question_callbacks;
 mod scsu;
 mod strings;
 pub(crate) mod time_services;
@@ -64,11 +78,13 @@ pub(crate) mod time_services;
 // memory where a firmware memory map bounds the reads.
 #[cfg(firmware_memory_maps)]
 mod system_table;
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+mod variable_changes;
 #[cfg(target_os = "uefi")]
 mod variable_services;
 mod variables;
 #[cfg(any(target_os = "windows", test))]
-mod win32;
+pub(crate) mod win32;
 // UEFI HII Library
 
 // Implements (partial) decoding of the Form and Strings packages.
@@ -106,9 +122,9 @@ pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "windows")]
 pub(crate) use hiidb_driver::read_hiidb;
 #[cfg(target_os = "uefi")]
-pub(crate) use keyword_access::get_keywords;
+pub(crate) use keyword_access::get_keywords_witnessed;
 #[cfg(target_os = "uefi")]
-pub(crate) use keyword_access::set_keywords;
+pub(crate) use keyword_access::set_keywords_witnessed;
 #[cfg(target_os = "uefi")]
 pub use keyword_access::KeywordFilterBy;
 #[cfg(target_os = "uefi")]
@@ -131,6 +147,8 @@ pub use memory_access_denied::MemoryAccessDenied;
 pub use memory_access_denied::MemoryDevice;
 #[cfg(target_os = "linux")]
 pub use memory_access_denied::MemoryOperation;
+pub(crate) use strings::MatchTier;
+pub(crate) use strings::PRIVATE_USE_AREA;
 #[cfg(firmware_memory_maps)]
 pub(crate) use system_table::system_vendor_table;
 #[cfg(firmware_memory_maps)]
@@ -146,12 +164,16 @@ pub(crate) use variable_services::VariableServices;
 pub(crate) use variables::EfivarReader;
 pub use variables::EfivarSource;
 pub(crate) use variables::FirmwareVariables;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use variables::PasswordBytesRefusal;
 pub use variables::VariableAttributes;
 #[cfg(variable_data)]
 pub(crate) use variables::VariableInterface;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use variables::VariableKey;
-#[cfg(variable_data)]
+#[cfg(all(variable_data, test))]
+pub(crate) use variables::VariableNotFound;
 pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;
+pub(crate) use variables::WithholdingVariables;
 pub(crate) use variables::VOLATILE_ANNOTATION;

@@ -17,8 +17,10 @@
 //! EFI_VARIABLE_AUTHENTICATION_3 metadata (UEFI 2.11 §8.2.1). `get` reads the variables whole
 //! from efivarfs, decodes the value behind the metadata of EnhancedAuthData and names the check
 //! that refuses that of EnhancedAuthRefused, as shell/auth87.tsv checks in the UEFI Shell; `set`
-//! refuses both and changes neither variable.
+//! refuses both and changes neither variable. `variable info` shows the metadata of
+//! EnhancedAuthData, and that of EnhancedAuthRefused as the check that refuses it.
 
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::variable_bytes;
@@ -102,5 +104,42 @@ fn set_refuses_enhanced_authenticated_variables() {
             );
             assert_eq!(seeded(variable), before, "{variable} after {prefix:?} set");
         }
+    }
+}
+
+#[test]
+fn variable_info_shows_the_metadata() {
+    let cert_id: String = (0..32u8).map(|byte| format!("{byte:02x}")).collect();
+    for (variable, metadata) in [
+        (
+            ACCEPTED,
+            serde_json::json!({
+                "version": 1,
+                "type": 1,
+                "metadata_size": 68,
+                "flags": 0,
+                "time_stamp": "2026-11-06T12:00:00Z",
+                "cert_id": {"type": 1, "id": {"hex": cert_id}},
+            }),
+        ),
+        (
+            REFUSED,
+            serde_json::json!({"refused": "EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1"}),
+        ),
+    ] {
+        seeded(variable);
+
+        let info: serde_json::Value = json(&["variable", "info", variable, VENDOR]);
+
+        assert_eq!(
+            info,
+            serde_json::json!({
+                "variable": format!("{variable}-{VENDOR}"),
+                "attributes": ATTRIBUTES,
+                "size": SIZE,
+                "metadata": metadata,
+            }),
+            "{variable}"
+        );
     }
 }

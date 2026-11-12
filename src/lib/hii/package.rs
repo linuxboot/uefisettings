@@ -466,6 +466,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     let mut disabled_forms = Vec::new();
     let mut first_var_stores = Vec::new();
     let mut device_path = None;
+    // the first FORM_SET op of the list, with the index of the first root of its form package
+    let mut first_form_set = None;
 
     for package in get_packages(package_list)? {
         let mut package_cursor = Cursor::new(&package.data);
@@ -484,11 +486,15 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                     .context("failed to parse a form package")?;
                 let roots_before = roots.len();
                 let outside_before = outside_ifr.len();
+                if first_form_set.is_none() {
+                    first_form_set = form_sets.first_form_set.map(|first| (roots_before, first));
+                }
                 first_var_stores.push(forms::FirstVarStores {
                     form_sets: roots_before..roots_before + form_sets.roots.len(),
                     outside: outside_before..outside_before + form_sets.outside.len(),
                     declared_by: form_sets.first_var_stores,
                     name_value_first: form_sets.name_value_first,
+                    declared: form_sets.declared,
                 });
                 roots.extend(form_sets.roots);
                 ignored_ifr.extend(form_sets.ignored);
@@ -516,6 +522,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         }
     }
 
+    forms::mark_package_list_first(&roots, first_form_set);
     // the PASSWORD ops of disabled forms keep their passwords in the variables of their VarNames
     let named: Vec<IFRNodeLink> = roots
         .iter()
@@ -559,6 +566,7 @@ mod tests {
 
     use super::hiidb_fixtures::*;
     use super::*;
+    use crate::hii::config_snapshot::tests::logged_by;
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::nested;
@@ -567,6 +575,8 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
+    use crate::hii::forms::PackageListFirst;
+    use crate::hii::forms::ParsedOperation;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::scsu::tests::EDK2_LANGUAGE_WINDOW;
     use crate::hii::strings::StringMap;
@@ -1273,6 +1283,67 @@ mod tests {
                 "roots and IFR ignored (offset, reason as expected) of {name}: {:?}",
                 list.ignored_ifr
             );
+        }
+    }
+
+    /// read_db marks each FormSet with the FORM_SET op that its package list starts with, which
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c GetIfrBinaryData takes for a Nil FormSet GUID
+    /// (:6075): the first FormSet its own, the others that one, also in a later form package, and
+    /// every FormSet one that does not parse.
+    #[test]
+    fn read_db_marks_the_form_set_that_each_package_list_starts_with() {
+        let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
+        let form_sets = |guids: &[u8]| -> Vec<u8> {
+            guids
+                .iter()
+                .flat_map(|&guid| form_set_of_guid(guid, &[]))
+                .collect()
+        };
+        let marks = |packages: Vec<Vec<u8>>| -> Vec<Option<PackageListFirst>> {
+            let hiidb = package_list_with_guid(
+                [0x22; 16],
+                &[packages.concat(), END_PACKAGE.to_vec()].concat(),
+            );
+            let lists = read_db(&hiidb).expect("read the HiiDB");
+            lists[0]
+                .forms
+                .iter()
+                .map(|root| {
+                    let form_set = Rc::clone(&root.borrow().children[0]);
+                    let form_set = form_set.borrow();
+                    match &form_set.parsed_data {
+                        ParsedOperation::FormSet(form_set) => form_set.package_list_first,
+                        other => panic!("a FORM_SET op first: {other:?}"),
+                    }
+                })
+                .collect()
+        };
+        let own = Some(PackageListFirst::Own);
+        let other = |guid: u8| Some(PackageListFirst::Other(Some(Guid::from([guid; 16]))));
+        let cases = [
+            (
+                "two FormSets of one form package",
+                vec![form_package_of(&form_sets(&[0xA0, 0xB0]))],
+                vec![own, other(0xA0)],
+            ),
+            (
+                "a FormSet in each of two form packages",
+                vec![
+                    form_package_of(&form_sets(&[0xA0])),
+                    form_package_of(&form_sets(&[0xB0, 0xC0])),
+                ],
+                vec![own, other(0xA0), other(0xA0)],
+            ),
+            (
+                "a first FormSet that does not parse",
+                vec![form_package_of(
+                    &[form_set_of_guid(0xA0, &short_checkbox), form_sets(&[0xB0])].concat(),
+                )],
+                vec![other(0xA0)],
+            ),
+        ];
+        for (name, packages, want) in cases {
+            assert_eq!(marks(packages), want, "{name}");
         }
     }
 
@@ -2162,6 +2233,7 @@ mod tests {
         let want = [strings::StringPackage {
             language: strings::Language(b"en-\xe9".to_vec()),
             strings: StringMap::from([(1, "A".into())]),
+            replaced: Default::default(),
         }];
         assert_eq!(list.strings, want, "the strings packages");
     }
@@ -3077,6 +3149,32 @@ mod tests {
         );
     }
 
+    /// read_db reads a FontName as it reads strings, a private use character (UEFI 2.11
+    /// §33.2.6.2.1) as U+FFFD, which only its debug log shows.
+    #[test]
+    fn font_names_read_ruled_out_characters_as_replacement_characters() {
+        // FONT_1 of Length 17 with FontName "A", U+E000, then EFI_HII_SIBT_END
+        let blocks = [
+            &[0x31, 0x40, 0x11, 0x00][..],
+            &FONT_1[4..11],
+            &[0x41, 0x00, 0x00, 0xE0, 0x00, 0x00],
+            &[0x00],
+        ]
+        .concat();
+        let mut got = Vec::new();
+
+        let logged = logged_by(|| {
+            got = strings_packages_of(&[en_strings_package_with_blocks(&blocks)]);
+        });
+
+        assert_eq!(got, [(language("en"), StringMap::new())], "strings");
+        let font = format!("EFI_HII_SIBT_FONT FontId 1: {:?}, ", "A\u{FFFD}");
+        assert!(
+            logged.iter().any(|message| message.starts_with(&font)),
+            "the FontName as read: {logged:?}"
+        );
+    }
+
     /// read_db shares the text of a DUPLICATE's string with the string that it names, "a
     /// previously defined string with the exact same string text" (UEFI 2.11 §33.3.6.2.1),
     /// copying none.
@@ -3603,5 +3701,136 @@ mod tests {
                 "{block_name} without EFI_HII_SIBT_END"
             );
         }
+    }
+
+    /// The string blocks of an EFI_HII_SIBT_STRING_UCS2 of the CHAR16s `units`, string 1.
+    fn ucs2_string_block(units: &[u16]) -> Vec<u8> {
+        let text: Vec<u8> = units
+            .iter()
+            .chain(&[0])
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        [&[0x14][..], &text].concat()
+    }
+
+    /// read_db reads as U+FFFD each character that UEFI 2.11 rules out of a string: a surrogate,
+    /// paired or not (§33.2.6.2.2 "UEFI does not support surrogate characters"), a private use
+    /// character (§33.2.6.2.1 "UEFI prohibits use of this area") and one between 0xF000 and
+    /// 0xFCFF (§33.3.6.3.2 "should be rejected"), in UCS-2 and SCSU strings alike. It keeps the
+    /// common control codes 0xF620-0xF62B, 0xF7zz and 0xF8zz (§33.2.6.2.4, Table 33.3) and a
+    /// U+FFFD that the string holds.
+    #[test]
+    fn characters_that_uefi_rules_out_read_as_replacement_characters() {
+        let blocks = [
+            // EFI_HII_SIBT_STRING_UCS2: 1
+            &ucs2_string_block(&[
+                0x0041, 0xE000, 0xD83D, 0xDE00, 0xDC00, 0xF900, 0xF62C, 0xF620, 0xF7AB, 0xF801,
+                0xFFFD, 0x0042,
+            ])[..],
+            // EFI_HII_SIBT_STRING_SCSU of SQU U+E000, then U+0000: 2
+            &[0x10, 0x0E, 0xE0, 0x00, 0x00],
+            // EFI_HII_SIBT_END
+            &[0x00],
+        ]
+        .concat();
+
+        let want = StringMap::from([
+            (
+                1,
+                "A\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{F620}\u{F7AB}\u{F801}\u{FFFD}B"
+                    .into(),
+            ),
+            (2, "\u{FFFD}".into()),
+        ]);
+        assert_eq!(
+            strings_packages_of(&[en_strings_package_with_blocks(&blocks)]),
+            [(language("en"), want)],
+            "a surrogate pair, a lone surrogate, private use, 0xF900 and 0xF62C read as U+FFFD"
+        );
+    }
+
+    /// Each rule ends at its bounds: 0xD7FF, 0xF62B, 0xF700, 0xF8FF, 0xFD00 and 0xFDFF stay;
+    /// 0xEFFF, 0xF000, 0xF61F, 0xF6FF, 0xFBFF, 0xFC00 and 0xFCFF read as U+FFFD.
+    #[test]
+    fn rule_bounds() {
+        let blocks = [
+            &ucs2_string_block(&[
+                0xD7FF, 0xEFFF, 0xF000, 0xF61F, 0xF62B, 0xF6FF, 0xF700, 0xF8FF, 0xFBFF, 0xFC00,
+                0xFCFF, 0xFD00, 0xFDFF,
+            ])[..],
+            &[0x00],
+        ]
+        .concat();
+
+        let want = StringMap::from([(
+            1,
+            "\u{D7FF}\u{FFFD}\u{FFFD}\u{FFFD}\u{F62B}\u{FFFD}\u{F700}\u{F8FF}\u{FFFD}\u{FFFD}\
+             \u{FFFD}\u{FD00}\u{FDFF}"
+                .into(),
+        )]);
+        assert_eq!(
+            strings_packages_of(&[en_strings_package_with_blocks(&blocks)]),
+            [(language("en"), want)],
+            "rule bounds"
+        );
+    }
+
+    /// read_db reads as U+FFFD, warning once per string, the SCSU characters that UEFI 2.11 rules
+    /// out of strings, as it does those of UCS-2 strings, and reads the strings after them: SQU
+    /// 0xF000, between 0xF000 and 0xFCFF (§33.3.6.3.1) and private use (§33.2.6.2.1), SQU 0xD800,
+    /// a surrogate, and U+10000, which SDX reaches, outside UCS-2 (§33.2.6.2.2). A control code
+    /// through 0x7F stays a control code without a warning (§33.2.6.2.4); SCSU encodes control
+    /// codes through 0x7F alone, so SQU 0xF620, a control code's 0xFxyy form, is ruled out
+    /// (§33.3.6.3.1).
+    #[test]
+    fn scsu_characters_that_uefi_rules_out_read_as_replacement_characters() {
+        let blocks = [
+            // EFI_HII_SIBT_STRING_SCSU of "A", SQU U+F000, then U+0000: 1
+            &[0x10, 0x41, 0x0E, 0xF0, 0x00, 0x00][..],
+            // EFI_HII_SIBT_STRING_SCSU of SQU U+D800, then U+0000: 2
+            &[0x10, 0x0E, 0xD8, 0x00, 0x00],
+            // EFI_HII_SIBT_STRING_SCSU of SDX of window 0 at 0x10000, 0x80, then U+0000: 3
+            &[0x10, 0x0B, 0x00, 0x00, 0x80, 0x00],
+            // EFI_HII_SIBT_STRING_UCS2 "Z": 4
+            &ucs2_string_block(&[0x5A]),
+            // EFI_HII_SIBT_STRING_SCSU of 0x7F 0x20, SQU U+F620, then U+0000: 5
+            &[0x10, 0x7F, 0x20, 0x0E, 0xF6, 0x20, 0x00],
+            // EFI_HII_SIBT_END
+            &[0x00],
+        ]
+        .concat();
+        let mut got = Vec::new();
+
+        let logged = logged_by(|| {
+            got = strings_packages_of(&[en_strings_package_with_blocks(&blocks)]);
+        });
+
+        let want = StringMap::from([
+            (1, "A\u{FFFD}".into()),
+            (2, "\u{FFFD}".into()),
+            (3, "\u{FFFD}".into()),
+            (4, "Z".into()),
+            (5, "\u{F620}\u{FFFD}".into()),
+        ]);
+        assert_eq!(got, [(language("en"), want)], "strings");
+        let warnings: Vec<&str> = logged
+            .iter()
+            .map(String::as_str)
+            .filter(|message| message.ends_with("it reads as U+FFFD"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "string 1 of the \"en\" strings package holds U+F000, which is in the private \
+                 use area (UEFI 2.11 §33.2.6.2.1): it reads as U+FFFD",
+                "string 2 of the \"en\" strings package holds U+D800, which is a surrogate (UEFI \
+                 2.11 §33.2.6.2.2): it reads as U+FFFD",
+                "string 3 of the \"en\" strings package holds U+10000, which is outside UCS-2 \
+                 (UEFI 2.11 §33.2.6.2.2): it reads as U+FFFD",
+                "string 5 of the \"en\" strings package holds U+F620, which is in the private \
+                 use area (UEFI 2.11 §33.2.6.2.1): it reads as U+FFFD",
+            ],
+            "warnings"
+        );
     }
 }

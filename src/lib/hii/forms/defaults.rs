@@ -46,6 +46,7 @@ use super::Range;
 use super::TypeValue;
 use super::Walk;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::ScsuRuledOut;
 
 // UEFI 2.10 §33.3.8.3.9, §33.3.8.3.51
 const EFI_IFR_CHECKBOX_DEFAULT: u8 = 0x01;
@@ -188,11 +189,10 @@ pub(super) enum DefaultError {
     #[error("EFI_IFR_TYPE_STRING default: string {0:#06x} not found")]
     StringNotFound(u16),
     #[error(
-        "EFI_IFR_TYPE_STRING default: string {id:#06x} holds {character:?} (U+{code:04X}), which \
-         UCS-2 has no character for (UEFI 2.11 §33.2.6.2.2)",
-        code = u32::from(*.character)
+        "EFI_IFR_TYPE_STRING default: string {id:#06x} is SCSU text with a character that UEFI \
+         rules out of strings, which holds no CHAR16s to copy"
     )]
-    StringNotUcs2 { id: u16, character: char },
+    StringRuledOut { id: u16 },
     #[error("EFI_IFR_TYPE_STRING default: {0}")]
     StringText(NotUcs2),
     #[error("EFI_IFR_DEFAULT value missing")]
@@ -667,6 +667,21 @@ fn takes_option_defaults(op_code: IFROpCode) -> bool {
     }
 }
 
+/// Returns the question's standard default, which a forms browser gives a question without
+/// storage before it reads it (edk2-stable202608 SetupBrowserDxe Setup.c:5956).
+pub(super) fn standard_default(
+    question: &IFROperation,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Option<Result<u64, DefaultError>> {
+    default_for_id(
+        question,
+        &question_scope(question),
+        DefaultId::STANDARD,
+        inputs,
+    )
+    .map(|value| value.and_then(TypedDefault::number))
+}
+
 /// Returns the question's default for `default_id`: EFI_IFR_DEFAULT, then a flagged
 /// EFI_IFR_ONE_OF_OPTION, then CHECKBOX Flags (UEFI 2.10 §33.3.8.3.9, §33.3.8.3.47). A flagged
 /// option of an ORDERED_LIST gives its Value's bytes, whatever SUPPRESS_IF is around it, as
@@ -823,20 +838,16 @@ pub(super) fn buffer_defaults(
         .collect()
 }
 
-/// The little-endian CHAR16s of the text of the string `id` that `texts` show, as
-/// edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault takes a default of Type STRING
-/// through HiiGetString in the platform language, refused with a character beyond UCS-2.
+/// The little-endian CHAR16s of the string `id` that `texts` show, as the firmware holds them
+/// (ListTexts::shown_units), as edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault
+/// copies a default of Type STRING from HiiGetString in the platform language; refused for an
+/// SCSU string with a character that UEFI rules out of strings, which holds none.
 pub(super) fn string_bytes(texts: &ListTexts<'_>, id: u16) -> Result<Vec<u8>, DefaultError> {
-    let text = texts
-        .shown_text(id)
-        .ok_or(DefaultError::StringNotFound(id))?;
-    if let Some(character) = text
-        .chars()
-        .find(|&character| u16::try_from(u32::from(character)).is_err())
-    {
-        return Err(DefaultError::StringNotUcs2 { id, character });
-    }
-    Ok(text.encode_utf16().flat_map(u16::to_le_bytes).collect())
+    let units = texts
+        .shown_units(id)
+        .ok_or(DefaultError::StringNotFound(id))?
+        .map_err(|ScsuRuledOut| DefaultError::StringRuledOut { id })?;
+    Ok(units.into_iter().flat_map(u16::to_le_bytes).collect())
 }
 
 /// Returns the text of the first option in the question's scope with `value` that no
@@ -888,14 +899,21 @@ mod tests {
     use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::CheckedVarStores;
     use super::super::IncludedStates;
     use super::super::QuestionMatch;
     use super::super::Selection;
+    use super::string_bytes;
     use super::DeclaredDefault;
     use super::DefaultError;
     use super::DefaultId;
     use super::DefaultValue;
     use super::OptionValueError;
+    use crate::hii::package::hiidb_fixtures::en_strings_package_with_blocks;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::read_db;
+    use crate::hii::strings::MatchTier;
 
     /// The MethodIdentifier of the test EFI_IFR_FORM_MAP method.
     const METHOD_IDENTIFIER: [u8; 16] = [0x33; 16];
@@ -1210,7 +1228,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         );
         let Selection::Picked {
@@ -1218,9 +1236,9 @@ mod tests {
         } = find_question(
             root,
             &ListTexts::new(&strings(), &[]),
-            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT]), MatchTier::Stored),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         else {
@@ -1251,7 +1269,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
 
@@ -1294,7 +1312,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
 
@@ -1337,7 +1355,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
 
@@ -1977,6 +1995,54 @@ mod tests {
 
             assert_eq!(flagged, [(DefaultId::STANDARD, want.to_string())], "{name}");
             assert_eq!(flagged, declared, "{name}: as an EFI_IFR_DEFAULT");
+        }
+    }
+
+    /// string_bytes gives the CHAR16s that a string held, as edk2-stable202608
+    /// SetupBrowserDxe/Setup.c GetQuestionDefault copies them from HiiGetString, also where a
+    /// character of it reads as U+FFFD: a surrogate pair or a private use character of a UCS-2
+    /// string, or of its DUPLICATE. An SCSU string with SQU U+E000 holds none and refuses.
+    #[test]
+    fn string_bytes_are_the_char16s_that_strings_held() {
+        let blocks = [
+            // EFI_HII_SIBT_STRING_UCS2 "A", U+D83D U+DE00: 1
+            &[0x14, 0x41, 0x00, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00][..],
+            // EFI_HII_SIBT_STRING_UCS2 "A", U+E000: 2
+            &[0x14, 0x41, 0x00, 0x00, 0xE0, 0x00, 0x00],
+            // EFI_HII_SIBT_STRING_SCSU of SQU U+E000, then U+0000: 3
+            &[0x10, 0x0E, 0xE0, 0x00, 0x00],
+            // EFI_HII_SIBT_DUPLICATE of string 1: 4
+            &[0x20, 0x01, 0x00],
+            // EFI_HII_SIBT_STRING_UCS2 "B": 5
+            &[0x14, 0x42, 0x00, 0x00, 0x00],
+            // EFI_HII_SIBT_END
+            &[0x00],
+        ]
+        .concat();
+        let hiidb = package_list_with_guid(
+            [0x22; 16],
+            &[
+                en_strings_package_with_blocks(&blocks),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+        let [list] = lists.as_slice() else {
+            panic!("{} package lists, not 1", lists.len());
+        };
+        let texts = ListTexts::new(&list.strings, &[]);
+        let surrogate_pair = vec![0x41, 0x00, 0x3D, 0xD8, 0x00, 0xDE];
+        let cases = [
+            (1, Ok(surrogate_pair.clone())),
+            (2, Ok(vec![0x41, 0x00, 0x00, 0xE0])),
+            (3, Err(DefaultError::StringRuledOut { id: 3 })),
+            (4, Ok(surrogate_pair)),
+            (5, Ok(vec![0x42, 0x00])),
+            (9, Err(DefaultError::StringNotFound(9))),
+        ];
+        for (id, want) in cases {
+            assert_eq!(string_bytes(&texts, id), want, "string {id}");
         }
     }
 }

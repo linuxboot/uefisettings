@@ -13,8 +13,9 @@
 //! The package list that `publish-hiidb.efi keyword-kinds-forms` registers for a handle of
 //! [`DRIVER_PATH`], for the UEFI Shell scenario `shell-keyword-kinds` of
 //! `tests/qemu/scenarios.tsv`: a form set with a DATE that suppresses its year, a TIME that
-//! suppresses its second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET and
-//! a REF5, each with an x-UEFI-ns keyword, on the VARSTORE_EFI KindStore, which the driver creates
+//! suppresses its second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET, a
+//! REF5, a STRING and a multi-line STRING, each with an x-UEFI-ns keyword, on the VARSTORE_EFI
+//! KindStore, which the driver creates
 //! with the VarStore's Attributes and Size when it is missing. The Keyword Handler finds the
 //! questions by the device path package that the HII database adds for that handle, and writes
 //! KindStore through SetVariable() with the VarStore's Attributes (edk2-stable202608
@@ -42,6 +43,7 @@ use crate::hii_package::EFI_IFR_FORM_SET_OP;
 use crate::hii_package::EFI_IFR_ONE_OF_OPTION_OP;
 use crate::hii_package::EFI_IFR_ORDERED_LIST_OP;
 use crate::hii_package::EFI_IFR_REF_OP;
+use crate::hii_package::EFI_IFR_STRING_OP;
 use crate::hii_package::EFI_IFR_TIME_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
 use crate::vendor_device_path;
@@ -68,31 +70,37 @@ const KIND_DATE: u16 = 2;
 const KIND_TIME: u16 = 3;
 const KIND_LIST: u16 = 4;
 const KIND_REF: u16 = 5;
-const TITLE: u16 = 6;
-const HELP: u16 = 7;
-const FIRST: u16 = 8;
-const SECOND: u16 = 9;
-const THIRD: u16 = 10;
-const STRINGS: [&str; 10] = [
+const KIND_STRING: u16 = 6;
+const KIND_TEXT: u16 = 7;
+const TITLE: u16 = 8;
+const HELP: u16 = 9;
+const FIRST: u16 = 10;
+const SECOND: u16 = 11;
+const THIRD: u16 = 12;
+const STRINGS: [&str; 12] = [
     "English",
     "Kind date",
     "Kind time",
     "Kind list",
     "Kind ref",
+    "Kind string",
+    "Kind text",
     "uefisettings QEMU keyword kinds forms",
-    "A DATE, a TIME, an ORDERED_LIST and a REF5 with x-UEFI-ns keywords",
+    "A DATE, a TIME, an ORDERED_LIST, a REF5 and two STRINGs with x-UEFI-ns keywords",
     "First",
     "Second",
     "Third",
 ];
 /// The x-UEFI-ns strings: the language name, as edk2's DriverSample names it, then the keywords
 /// of the prompts.
-const KEYWORDS: [&str; 5] = [
+const KEYWORDS: [&str; 7] = [
     "UefiNameSpace",
     "KindDate",
     "KindTime",
     "KindList",
     "KindRef",
+    "KindString",
+    "KindText",
 ];
 
 // The VarStore and the questions' VarOffsets
@@ -101,6 +109,8 @@ const DATE_OFFSET: u16 = 0;
 const TIME_OFFSET: u16 = 4;
 const LIST_OFFSET: u16 = 8;
 const REF_OFFSET: u16 = 12;
+const STRING_OFFSET: u16 = 34;
+const TEXT_OFFSET: u16 = 42;
 
 /// EFI_QF_DATE_YEAR_SUPPRESS (UEFI 2.11 §33.3.8.3.11).
 const YEAR_SUPPRESS: u8 = 0x01;
@@ -110,6 +120,10 @@ const SECOND_SUPPRESS: u8 = 0x04;
 const UNIQUE_SET: u8 = 0x01;
 /// The MaxContainers of the ORDERED_LIST.
 const MAX_CONTAINERS: u8 = 3;
+/// The MaxSize of each STRING, in CHAR16s: 3 characters and the NULL.
+const STRING_MAX_SIZE: u8 = 4;
+/// EFI_IFR_STRING_MULTI_LINE (UEFI 2.11 §33.3.8.3.70).
+const MULTI_LINE: u8 = 0x01;
 /// EFI_IFR_TYPE_NUM_SIZE_8 (UEFI 2.11 §33.3.8.3.51).
 const UINT8_TYPE: u8 = 0x00;
 
@@ -130,7 +144,8 @@ pub(crate) fn package_list_bytes() -> Vec<u8> {
 /// items 1, 2 and 3 at [`LIST_OFFSET`], and at [`REF_OFFSET`] the EFI_HII_REF of the REF5 itself
 /// (QuestionId 4, FormId 1, FormSetGuid [`FORM_SET`], DevicePath 0), its last 22 bytes, as edk2's
 /// HiiConfigToBlock refuses a block past the variable's end (ConfigRouting.c :6383-6386); 0 in
-/// bytes 7 and 11, which are in no question.
+/// bytes 7 and 11, which are in no question, and the empty strings, all NULL CHAR16s, at
+/// [`STRING_OFFSET`] and [`TEXT_OFFSET`].
 pub(crate) fn store_data() -> Vec<u8> {
     [
         &[0xE8, 0x07, 3, 31][..],
@@ -142,6 +157,8 @@ pub(crate) fn store_data() -> Vec<u8> {
         &1u16.to_le_bytes(),
         &FORM_SET.to_bytes(),
         &0u16.to_le_bytes(),
+        &[0; 2 * STRING_MAX_SIZE as usize],
+        &[0; 2 * STRING_MAX_SIZE as usize],
     ]
     .concat()
 }
@@ -197,6 +214,8 @@ fn form_package() -> Vec<u8> {
             false,
             &question_header(KIND_REF, HELP, 4, STORE, REF_OFFSET),
         ),
+        string(5, KIND_STRING, STRING_OFFSET, 0),
+        string(6, KIND_TEXT, TEXT_OFFSET, MULTI_LINE),
     ];
     let form = [1u16.to_le_bytes(), TITLE.to_le_bytes()].concat();
     let body = [
@@ -220,4 +239,15 @@ fn date_time(op_code: u8, id: u16, prompt: u16, offset: u16, flags: u8) -> Vec<u
     ]
     .concat();
     [op(op_code, true, &data), end()].concat()
+}
+
+/// A STRING of question `id` at VarOffset `offset` of [`STORE`], of MinSize 0, MaxSize
+/// [`STRING_MAX_SIZE`] and `flags` (UEFI 2.11 §33.3.8.3.70).
+fn string(id: u16, prompt: u16, offset: u16, flags: u8) -> Vec<u8> {
+    let data = [
+        &question_header(prompt, HELP, id, STORE, offset)[..],
+        &[0, STRING_MAX_SIZE, flags],
+    ]
+    .concat();
+    op(EFI_IFR_STRING_OP, false, &data)
 }

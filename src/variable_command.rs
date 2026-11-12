@@ -47,6 +47,8 @@ use crate::UnsafeArgs;
 use crate::UNSAFE_ARG;
 
 #[cfg(variable_data)]
+mod boot_manager;
+#[cfg(variable_data)]
 mod write_signed;
 
 #[derive(Debug, Parser)]
@@ -66,7 +68,7 @@ enum VariableSubcommands {
         #[arg(long)]
         guid: Option<String>,
     },
-    /// Show the attributes and the size of an EFI variable, never its data
+    /// Show the attributes and the size of an EFI variable, and the EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access, never its data
     #[cfg(variable_info)]
     #[command(next_display_order = None)]
     Info {
@@ -75,17 +77,18 @@ enum VariableSubcommands {
         guid: String,
     },
     /// Show the attributes and the decoded value of a global variable of UEFI 2.11 section 3.3,
-    /// but its load options, hot keys and device paths, or of a signature database, or that it is
-    /// absent
+    /// its load options, hot keys and device paths as text among them, or of a signature database,
+    /// or that it is absent
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     Get {
-        /// The variable, such as Timeout, BootOrder, SecureBoot, db or devdb
+        /// The variable, such as Timeout, BootOrder, Boot0001, Key0000, ConOut, SecureBoot, db
+        /// or devdb
         name: String,
         /// The vendor GUID of the variable, which must be its own:
         /// D719B2CB-3D3A-4596-A3BC-DAD00E67656F for db, dbx, dbt and dbr,
-        /// B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD for devdb, else
-        /// 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+        /// B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD for devdb, that which OsRecoveryOrder lists for
+        /// OsRecovery####, else 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
         guid: Option<String>,
     },
     /// Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout, BootOrder,
@@ -115,6 +118,9 @@ enum VariableSubcommands {
     #[command(next_display_order = None)]
     // Boxed, as its arguments outgrow every other variant's (clippy::large_enum_variant).
     WriteSigned(Box<write_signed::WriteSignedArgs>),
+    #[cfg(variable_data)]
+    #[command(flatten)]
+    BootManager(boot_manager::BootManagerSubcommands),
 }
 
 /// What variable set refuses without --i-am-fine-to-brick-this-system.
@@ -216,6 +222,8 @@ impl VariableCommand {
             VariableSubcommands::Storage { attributes } => storage(attributes),
             #[cfg(variable_data)]
             VariableSubcommands::WriteSigned(args) => args.run(),
+            #[cfg(variable_data)]
+            VariableSubcommands::BootManager(command) => command.run(),
         }
     }
 }
@@ -248,8 +256,9 @@ fn list_report(keys: &[VariableKey]) -> serde_json::Value {
         .collect()
 }
 
-/// Prints the attributes and the size of the EFI variable `name` of the vendor GUID `guid`: info,
-/// and hii variable-info of the UEFI Shell build.
+/// Prints the attributes and the size of the EFI variable `name` of the vendor GUID `guid`, and
+/// its EFI_VARIABLE_AUTHENTICATION_3 metadata if it has any: info, and hii variable-info of the
+/// UEFI Shell build.
 #[cfg(variable_info)]
 pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
     let info = VariableBackend::info(name, guid)?;
@@ -266,7 +275,7 @@ fn print_global(name: &str, guid: Option<&str>) -> Result<()> {
     print_global_variable(&VariableBackend::get(name, guid)?)
 }
 
-/// Prints `global` as one line of JSON, for print_global and set.
+/// Prints `global` as one line of JSON, for print_global, set and the boot manager's writes.
 #[cfg(variable_data)]
 fn print_global_variable(global: &GlobalVariable) -> Result<()> {
     print_json(global)?;
@@ -354,7 +363,8 @@ mod tests {
                 #[cfg(variable_data)]
                 parsed @ (VariableSubcommands::Get { .. }
                 | VariableSubcommands::Set(_)
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::Storage { .. } => {
@@ -376,7 +386,8 @@ mod tests {
             #[cfg(variable_data)]
             parsed @ (VariableSubcommands::Get { .. }
             | VariableSubcommands::Set(_)
-            | VariableSubcommands::WriteSigned(_)) => {
+            | VariableSubcommands::WriteSigned(_)
+            | VariableSubcommands::BootManager(_)) => {
                 panic!("{args:?} is no info: {parsed:?}")
             }
             parsed @ (VariableSubcommands::List { .. } | VariableSubcommands::Storage { .. }) => {
@@ -417,7 +428,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Set(_)
                 | VariableSubcommands::Storage { .. }
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no get: {parsed:?}")
                 }
             };
@@ -450,7 +462,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
                 | VariableSubcommands::Storage { .. }
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no set: {parsed:?}")
                 }
             };
@@ -515,7 +528,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
                 | VariableSubcommands::Storage { .. }
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no set: {parsed:?}")
                 }
             };
@@ -579,7 +593,8 @@ mod tests {
                 #[cfg(variable_data)]
                 parsed @ (VariableSubcommands::Get { .. }
                 | VariableSubcommands::Set(_)
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::List { .. } => {

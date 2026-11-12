@@ -28,8 +28,8 @@ Device memory as arm64 does. On Ubuntu 26.04 it also needs the packages of
 xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes
 ```
 
-The guest's kernel, firmware, UEFI Shell and busybox do not come from the host: they are the
-packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
+The guest's kernel and its FAT modules, firmware, UEFI Shell and busybox do not come from the
+host: they are the packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
 [i686](guest-packages-i686) or [aarch64](guest-packages-aarch64)) pins, which
 [`fetch-packages.sh`](fetch-packages.sh) downloads. `run.sh` first runs
 [`fetch-packages-test.sh`](fetch-packages-test.sh), which checks on local fixtures how that
@@ -53,7 +53,7 @@ tests/qemu/run.sh x86_64 boot-smoke   # the named scenarios
 ```
 
 Elsewhere, these tools must be on `PATH`: `qemu-system-x86_64`, `qemu-system-i386`,
-`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio`, `flock` and `openssl` for `run.sh`;
+`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio`, `flock`, `openssl` and `sfdisk` for `run.sh`;
 `curl`, `rpm2cpio`, `cpio`, `ar`, `tar`, `xz` and `zstd` for `fetch-packages.sh`; and,
 unless DriverSample.efi is already built, `gcc`, `g++`, `make`, `git`, `nasm`, `python3`
 and the libuuid headers for [`build-driver-sample.sh`](build-driver-sample.sh), which
@@ -277,6 +277,19 @@ variable that [`vars/disabled-form.json`](vars/disabled-form.json) creates: in t
 `shell-disabled-form`, `uefisettings.efi` reads and writes the questions of its other form, and
 no byte of that PASSWORD.
 
+`publish-hiidb.efi form-set-disable-if-forms` registers those of
+[`publish-hiidb/src/form_set_disable_if_forms.rs`](publish-hiidb/src/form_set_disable_if_forms.rs):
+a form set on the variable that [`vars/form-set-disable-if.json`](vars/form-set-disable-if.json)
+creates, whose forms but the first are in DISABLE_IFs outside forms. A true one holds the form of
+Hidden and of a PASSWORD, which a question of the first form overlaps; one on a question holds the
+form of After; and a false one holds a true SUPPRESS_IF, then the form of Later. In the scenario
+`hii-form-set-disable-if`, whose later `publish-hiidb.efi rt-data` exports the database, and in
+`shell-form-set-disable-if`, Hidden and the PASSWORD are no questions with any `--include`, a
+SUPPRESS_IF on Hidden does not suppress, no byte of the password shows or is written, and After and
+Later may be disabled, so `set` writes them only with disabled questions included. From Linux, the
+x-UEFI-ns keyword of Hidden selects it as a disabled question, and `hii dump-efivars` keeps its byte
+for that keyword, but no byte of the password.
+
 `publish-hiidb.efi short-var-store-forms` registers those of
 [`publish-hiidb/src/short_var_store_forms.rs`](publish-hiidb/src/short_var_store_forms.rs):
 questions on a VARSTORE_EFI of the form before UEFI 2.3.1, each on the EFI variable of its
@@ -316,14 +329,18 @@ question beside it reads, and in the UEFI Shell writes.
 
 `publish-hiidb.efi keyword-kinds-forms` creates the variable `KindStore` unless it exists, with
 its VarStore's Attributes and Size, and registers the forms of
-[`publish-hiidb/src/keyword_kinds_forms.rs`](publish-hiidb/src/keyword_kinds_forms.rs) for a
-new handle of a vendor device path: a DATE that suppresses its year, a TIME that suppresses its
-second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET and a REF5 on
-`KindStore`, each with an x-UEFI-ns keyword. In the scenario `shell-keyword-kinds`,
-`uefisettings.efi hii keyword set` writes the DATE, the TIME and the ORDERED_LIST through edk2's
-Config Keyword Handler, one at a time and two in one SetData(), and refuses before any call a
+[`publish-hiidb/src/keyword_kinds_forms.rs`](publish-hiidb/src/keyword_kinds_forms.rs) for a new
+handle of a vendor device path: a DATE that suppresses its year, a TIME that suppresses its
+second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET, a REF5, and a
+STRING and a multi-line STRING of MaxSize 4 on `KindStore`, each with an x-UEFI-ns keyword. In
+the scenario `shell-keyword-kinds`, `uefisettings.efi hii keyword set` writes the DATE, the
+TIME, the ORDERED_LIST and the STRINGs through edk2's Config Keyword Handler, one at a time and
+two in one SetData(), and `hii keyword get` reads the STRING back. It refuses before any call a
 VALUE that changes a suppressed field, an hour out of range, a container after an empty one, an
-option twice and the REF, which `dmpstore` shows wrote nothing.
+option twice and the REF, and of a STRING a VALUE of 4 characters, of a character after the
+NULL, of a Private Use Area character, of a UTF-16 surrogate, of a line feed in the single-line
+STRING, of fewer bytes than MaxSize CHAR16s or with &READONLY, which `dmpstore` shows wrote
+nothing.
 
 `publish-hiidb.efi name-value-password-forms` registers the package lists of
 [`publish-hiidb/src/name_value_password_forms.rs`](publish-hiidb/src/name_value_password_forms.rs)
@@ -338,8 +355,22 @@ and `publish-hiidb.efi export-config-name-value-password` does it before it inst
 ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of the
 VARSTORE_NAME_VALUE. In the scenarios `shell-name-value-password`, `hii-name-value-password` and
 `hii-name-value-password-snapshot` `uefisettings` reads and writes no variable of that HiiDB, in
-the UEFI Shell and from Linux, and shows no byte of `NvBacking`, nor of the snapshot, while
-`hii list-questions --no-efivars` lists its questions from Linux.
+the UEFI Shell and from Linux, and shows no byte of `NvBacking`, nor of the snapshot, not even
+through a STRING on the PASSWORD's name, while `hii list-questions --no-efivars` lists its
+questions from Linux.
+
+`publish-hiidb.efi rt-data-name-value-string-forms` registers the forms of
+[`publish-hiidb/src/name_value_string_forms.rs`](publish-hiidb/src/name_value_string_forms.rs)
+for a handle with a device path of its own: STRING questions of MaxSize 4 and a CHECKBOX on the
+names of a VARSTORE_NAME_VALUE, beside no PASSWORD, then publishes the database as `rt-data`
+does. `publish-hiidb.efi export-config-name-value-string` registers them before it installs
+ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of the
+VARSTORE_NAME_VALUE that gives each STRING the digits of a string, 4 per CHAR16: shorter than
+MaxSize, with a NULL after it, of MaxSize characters, with and without a NULL, longer than
+MaxSize, with a CHAR16 of 2 digits, and empty. In the scenario `hii-name-value-string-snapshot`
+`get`, `hii list-questions` and `hii show-ifr` take each STRING's characters from the snapshot,
+or say why its setting holds none, and the CHECKBOX's number, while with `--no-efivars`, and in
+`hii-name-value-string`, which lists no snapshot, each question says why it has no value.
 
 `publish-hiidb.efi storageless-password-forms` registers the package lists of
 [`publish-hiidb/src/storageless_password_forms.rs`](publish-hiidb/src/storageless_password_forms.rs)
@@ -358,12 +389,30 @@ export-config-storageless-password` does it before it installs ExportConfig()'s 
 with `--i-am-fine-to-brick-this-system`, and shows no byte of `SlBacking`, nor of the snapshot,
 while `hii list-questions --no-efivars` lists its questions from Linux.
 
+`publish-hiidb.efi undeclared-password-forms` registers the package lists of
+[`publish-hiidb/src/undeclared_password_forms.rs`](publish-hiidb/src/undeclared_password_forms.rs)
+for one device path: a form set with a NUMERIC, of the x-UEFI-ns keyword `UndeclaredSetting`, over
+the variable `UdBacking`, which [`vars/undeclared-password.json`](vars/undeclared-password.json)
+creates, and a PASSWORD question of VarStoreId 9, which no VarStore of its form package declares,
+then a form set with a NUMERIC over the variable `Other`. Such a VarStoreId names no VarStore (UEFI
+2.11 §33.3.8.2.2 asks for "a previously declared variable store"), so the password may be in any
+variable. `publish-hiidb.efi rt-data-undeclared-password-forms` does the same, then publishes the
+database as `rt-data` does, and `publish-hiidb.efi export-config-undeclared-password` does it
+before it installs ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of
+`UdBacking`. In the scenarios `shell-undeclared-password`, `hii-undeclared-password` and
+`hii-undeclared-password-snapshot` `uefisettings` reads and writes no variable of that HiiDB, in the
+UEFI Shell and from Linux, even with `--i-am-fine-to-brick-this-system`, and shows no byte of
+`UdBacking`, nor of the snapshot, while `hii list-questions --no-efivars` lists its questions from
+Linux.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
 set to FALSE. The scenario `hii-systab` and, on aarch64 with `kernel=vamap`, `hii-systab-vamap`
 check that the Linux build reads it with `--hii-source systab` and in the automatic order, where
-the vendor ACPI tables and the `HiiDB` variable report their sources absent.
+the vendor ACPI tables and the `HiiDB` variable report their sources absent; and that it refuses
+`--hii-source` in `show-translations`, `ilo` and `hii list-strings -f`, and `--efivar-memory`
+with `--hii-source systab`.
 
 `publish-hiidb.efi export-config` installs the current configuration that EDK2 exports with
 `PcdHiiOsRuntimeSupport` too (UEFI 2.11 §33.2.11.1): `ExportConfig()`'s results, in a zeroed
@@ -423,6 +472,41 @@ InitCapsuleMaxVariable()), as the variable store that seeds them holds no volati
 `shell-capsule-results` and `shell-capsule-results-i686` check that `uefisettings.efi` prints the
 same results in the UEFI Shell, and the table.
 
+## Staged sets
+
+The scenario `staged-set` stages a set for the next boot from Linux and has the firmware apply
+it, on each architecture. Its option `devices=esp-disk` has `run.sh` attach a writable 64 MiB
+disk image, which its boots share and `sfdisk` partitions as [`esp-disk.sfdisk`](esp-disk.sfdisk):
+the EFI system partition is GPT entry 2 but the first partition on the disk. `run.sh` also puts
+in the initramfs the modules that Linux needs to mount that partition, on x86_64 and aarch64
+only the FAT modules of `kernel-modules-core`, and the UEFI Shell's `uefisettings.efi`. The guest
+test [`staged_set`](guest/tests/staged_set.rs) formats that partition and stages questions of
+`publish-hiidb.efi callback-forms`, whose driver holds their value, with `set --image`.
+
+Its `rebooting-shell:` boots run QEMU without `-no-reboot`, so that a reset restarts the
+firmware. Before the UEFI Shell, the firmware starts the staged set's `Boot####` from
+`BootNext`; its `uefisettings.efi` applies the set, prints each result and the deletion of the
+`Boot####`, and resets the platform. In the other two boots, the firmware finds no image, as the
+test deleted it, or a question's `Callback(CHANGED)` resets the platform before any result.
+[`check-shell-log.sh`](check-shell-log.sh) reads what the firmware printed before the Shell,
+through every reset, as the step `firmware`.
+
+## Boot manager
+
+The scenario `boot-manager` reads and writes the boot manager's variables (UEFI 2.11 §3.1)
+from Linux and from the UEFI Shell. [`vars/boot-manager.json`](vars/boot-manager.json) seeds
+its variable store with `Boot0099`, a load option of a file that no ESP holds, with an
+undefined attribute bit and OptionalData, which `BootOrder` does not list, and `Key0099`, a hot
+key, CTRL-q, to `Boot0099`, whose `BootOptionCrc` is the CRC-32 of that `Boot0099`. The
+firmware's boot manager keeps both, as it keeps every load option that it did not create, and
+ignores a key whose CRC does not match. Its `Driver0000` loads `DriverSample.efi`, as in the HII
+scenarios. Its Linux boot creates `Boot009A`, to the firmware's UEFI Shell, names it in
+`BootNext` and creates `Key009A`, ALT-F11 to `Boot0099`; the firmware starts the Shell through
+`Boot009A`, and the Shell creates `Boot009B`, of the short-form File Path of `uefisettings.efi`,
+names that in `BootNext` and creates `Key009B`, SHIFT-F12 to `Boot009B`. In the next boot,
+`uefisettings.efi` prints its usage and returns, and the firmware starts the Shell of `BootOrder`.
+The Shell checks read the lines in which the firmware's boot manager logged each load.
+
 ## Secure Boot
 
 The scenarios with `firmware=secboot-setup` or `firmware=secboot-user` in their options boot
@@ -474,6 +558,17 @@ those that `variable write-signed` signs at a TimeStamp, with a nonce and with a
 refuses them before any write, as its efivarfs lacks the attribute, and the firmware with
 EFI_INVALID_PARAMETER, as EDK2's variable driver takes no such attribute; the variable stays
 absent.
+
+`shell-auth3-checks`, with `devices=virtio-rng`, seeds the variables of
+[`vars/enhanced-auth-87.json`](vars/enhanced-auth-87.json) on the User Mode firmware, among them
+`EnhancedAuthNonce`, whose metadata holds a nonce, and checks that `uefisettings.efi variable
+write-signed` refuses, before it seeds or writes, what the firmware would refuse against the stored
+metadata (UEFI 2.11 §8.2.3, §8.2.5): a TimeStamp that is not later, other attributes, another Type,
+metadata of Version 2, the variable's own nonce, a `--current-nonce` other than its own, and one for
+a variable that does not exist. A later TimeStamp, and another nonce, which signs the variable's own
+as the current one, reach SetVariable(), which refuses them with EFI_INVALID_PARAMETER as above;
+every variable stays as seeded. `variable info` shows the metadata of `EnhancedAuthNonce` and the
+refusal of that of `EnhancedAuthRefused`.
 
 `shell-devdb-setup` checks, in Setup Mode, that `uefisettings.efi` refuses an append to devdb, the
 device signature database of UEFI 2.11 §32.6.3, signed with PK's key, before any write, and

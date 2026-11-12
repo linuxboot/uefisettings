@@ -22,6 +22,7 @@ use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION;
 use windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED;
+use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 
@@ -42,6 +43,14 @@ impl Win32Error {
     pub(crate) const INSUFFICIENT_BUFFER: Self = Self(ERROR_INSUFFICIENT_BUFFER);
     pub(crate) const ENVVAR_NOT_FOUND: Self = Self(ERROR_ENVVAR_NOT_FOUND);
     pub(crate) const NOT_ALL_ASSIGNED: Self = Self(ERROR_NOT_ALL_ASSIGNED);
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(
+            dead_code,
+            reason = "only the ESP's locator, built on Linux and Windows, reads it"
+        )
+    )]
+    pub(crate) const NO_MORE_FILES: Self = Self(ERROR_NO_MORE_FILES);
 
     /// The calling thread's last Win32 error.
     #[cfg(target_os = "windows")]

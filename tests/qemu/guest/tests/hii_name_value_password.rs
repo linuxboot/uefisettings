@@ -21,7 +21,8 @@
 //! the whole HiiDB, the question of the second list too, naming the PASSWORD, and write nothing,
 //! while list-questions without efivars reads; nothing shows 0x7A5BC3E1. In
 //! hii-name-value-password-snapshot, the ExportConfig snapshot holds 0x7A5BC3E1 for "Pin", and no
-//! question shows a value from it either.
+//! question shows a value from it either, not even the STRING on "Pin", which would read its
+//! digits as the characters U+7A5B and U+C3E1.
 
 use std::path::Path;
 
@@ -38,6 +39,8 @@ const NV_BACKING: &str = "/sys/firmware/efi/efivars/NvBacking-8c78a505-baa0-4c4a
 const BACKING_SETTING: &str = "Backing setting";
 /// The UINT32 NUMERIC on "Pin" of the VARSTORE_NAME_VALUE.
 const PIN_NUMBER: &str = "Name value pin as a number";
+/// The STRING on "Pin" of the VARSTORE_NAME_VALUE, of MaxSize 4.
+const PIN_STRING: &str = "Name value pin as a string";
 /// The UINT16 NUMERIC over Other, of the second package list.
 const OTHER_SETTING: &str = "Other setting";
 /// The PASSWORD that edk2 may route to the VARSTORE_NAME_VALUE, which the refusals name.
@@ -57,6 +60,12 @@ const PIN_TEXTS: [&str; 5] = [
     "e1 c3 5b 7a",
     "225, 195, 91, 122",
 ];
+/// The characters that a STRING would read from the snapshot's digits of 0x7A5BC3E1, 4 per
+/// `<Char>` (UEFI 2.11 §35.2.1.2).
+const PIN_CHARACTERS: [char; 2] = ['\u{7a5b}', '\u{c3e1}'];
+/// Why a question of the VARSTORE_NAME_VALUE has no value without the snapshot.
+const NAME_VALUE: &str =
+    "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
 /// What tags a value from the ExportConfig snapshot.
 const SNAPSHOT_TAG: &str = " <snapshot>";
 /// What the debug log says where the configuration table lists no ExportConfig snapshot.
@@ -72,7 +81,7 @@ enum Snapshot {
 }
 
 /// Runs `uefisettings` with `args` and TRACE; panics if its standard output or error holds any
-/// of PIN_TEXTS, in any case, or SNAPSHOT_TAG.
+/// of PIN_TEXTS, in any case, any of PIN_CHARACTERS, also as a JSON escape, or SNAPSHOT_TAG.
 #[track_caller]
 fn showing_no_pin(args: &[&str]) -> Output {
     let output = uefisettings_with_env(args, &TRACE);
@@ -85,6 +94,15 @@ fn showing_no_pin(args: &[&str]) -> Output {
             !stdout.contains(text) && !stderr.contains(text),
             "{args:?} shows {text:?}: {output:#?}"
         );
+    }
+    for character in PIN_CHARACTERS {
+        let escaped = format!("\\u{:04x}", u32::from(character));
+        for text in [character.to_string(), escaped] {
+            assert!(
+                !stdout.contains(&text) && !stderr.contains(&text),
+                "{args:?} shows {text:?}: {output:#?}"
+            );
+        }
     }
     assert!(
         !output.stdout.contains(SNAPSHOT_TAG) && !output.stderr.contains(SNAPSHOT_TAG),
@@ -111,7 +129,7 @@ fn refused(args: &[&str]) -> Output {
 /// get refuses each question, of either package list.
 fn get_refuses_every_question() {
     for prefix in PREFIXES {
-        for question in [BACKING_SETTING, PIN_NUMBER, OTHER_SETTING] {
+        for question in [BACKING_SETTING, PIN_NUMBER, PIN_STRING, OTHER_SETTING] {
             refused(&[prefix, &["get", "--json", question]].concat());
         }
     }
@@ -130,16 +148,26 @@ fn list_questions_refuses_beside_the_snapshot(snapshot: Snapshot) {
 }
 
 /// list-questions without efivars reads no variable, so it lists the questions of both package
-/// lists.
+/// lists, and the STRING on "Pin" says why it has no value.
 fn list_questions_reads_without_efivars() {
     let output = showing_no_pin(&["hii", "list-questions", "--json", "--no-efivars"]);
     let listed: Vec<Question> = output.json(0);
-    for name in [BACKING_SETTING, PIN_NUMBER, OTHER_SETTING] {
+    for name in [BACKING_SETTING, PIN_NUMBER, PIN_STRING, OTHER_SETTING] {
         assert!(
             listed.iter().any(|question| question.name == name),
             "list-questions --no-efivars: {name}: {listed:#?}"
         );
     }
+    let answers: Vec<&str> = listed
+        .iter()
+        .filter(|question| question.name == PIN_STRING)
+        .map(|question| question.answer.as_str())
+        .collect();
+    assert_eq!(
+        answers,
+        [NAME_VALUE],
+        "list-questions --no-efivars: {PIN_STRING}"
+    );
 }
 
 /// set refuses the question over NvBacking and writes nothing.

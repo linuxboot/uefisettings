@@ -1,5 +1,8 @@
 # The checks of shell/variable-get.nsh, the boot of shell-variable-get: get decodes Timeout and
-# BootOrder, and the default firmware has no SecureBoot or SetupMode. See check-shell-log.sh.
+# BootOrder, and the default firmware has no SecureBoot or SetupMode. It shows Boot0001 and
+# Boot0002 as the firmware's boot manager logged them when it tried them before the shell, the
+# first, "UEFI Misc Device", in vain; Key0000, F2 to Boot0000, whose CRC matches; and ConOut as
+# text. See check-shell-log.sh.
 timeout	status	0x0
 timeout	json	.variable == "Timeout-8be4df61-93ca-11d2-aa0d-00e098032b8c" and .attributes == 7 and (.value | type) == "number"
 boot-order	status	0x0
@@ -8,5 +11,13 @@ secure-boot	status	0x0
 secure-boot	json	. == {"variable": "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c", "absent": true}
 setup-mode	status	0x0
 setup-mode	json	. == {"variable": "SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c", "absent": true}
+boot0001	status	0x0
+boot0001	firmware	.value as $v | .variable == "Boot0001-8be4df61-93ca-11d2-aa0d-00e098032b8c" and ($v.device_paths | length) == 1 and ($firmware | any(startswith("BdsDxe: failed to load Boot0001 \"\($v.description)\" from \($v.device_paths[0]): ")))
+boot0002	status	0x0
+boot0002	firmware	.value as $v | .variable == "Boot0002-8be4df61-93ca-11d2-aa0d-00e098032b8c" and ($v.device_paths | length) == 1 and ($firmware | any(. == "BdsDxe: loading Boot0002 \"\($v.description)\" from \($v.device_paths[0])"))
+key0000	status	0x0
+key0000	json	. == {"variable": "Key0000-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"revision": 0, "modifiers": [], "keys": ["F2"], "boot_option": "Boot0000", "crc_matches": true}}
+con-out	status	0x0
+con-out	json	.variable == "ConOut-8be4df61-93ca-11d2-aa0d-00e098032b8c" and .attributes == 7 and (.value | type) == "string" and (.value | contains("/Uart(115200,8,N,1)/"))
 unknown	status	aborted
-unknown	line	`uefisettings variable info Boot0000 GUID`
+unknown	line	`uefisettings variable info Boot001 GUID`

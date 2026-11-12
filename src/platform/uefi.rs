@@ -17,6 +17,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 use std::ptr;
 use std::ptr::NonNull;
 use std::time::SystemTime;
@@ -25,6 +26,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use clap::Subcommand;
+use log::debug;
 use log::warn;
 use uefi::boot;
 use uefi::boot::OpenProtocolAttributes;
@@ -35,6 +37,8 @@ use uefi::proto::console::text::InputEx;
 use uefi::proto::console::text::Key;
 use uefi::proto::console::text::ScanCode;
 use uefi::proto::unsafe_protocol;
+use uefi::runtime;
+use uefi::runtime::ResetType;
 use uefi::CStr16;
 use uefi::CString16;
 use uefi::Handle;
@@ -72,11 +76,11 @@ use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_apply_staged_line;
 use crate::print_display_or_json;
 use crate::print_lifted;
 use crate::unsafe_long_help;
 use crate::variable_command::print_info;
-use crate::HiiSourceArgs;
 use crate::IncludeArgs;
 use crate::JsonArgs;
 use crate::QuestionArgs;
@@ -100,12 +104,29 @@ pub(super) const SET_LONG_ABOUT: &str = "Set/change the value of a question.\n\n
      \"causes the system to wake up or power on at the set time\" (UEFI 2.11 §8.3.4), as \
      edk2-stable202608 SetupBrowserDxe/Setup.c:2051 does.";
 
-/// The help of --hii-source, which this build ignores.
-pub(super) const HII_SOURCE_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
-/// The help of --efivar-memory, which this build ignores.
-pub(super) const EFIVAR_MEMORY_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
+/// None: this build reads the HiiDB by the HII Database Protocol alone, so it has no
+/// --hii-source or --efivar-memory, which clap refuses as unexpected arguments rather than ignore
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceArgs {}
+
+impl HiiSourceArgs {
+    /// Ok: neither flag exists here.
+    pub(super) fn refuse_given(&self, _why: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The Linux build's seam to the HII backend, which its tests replace; empty, as the commands
+/// here reach the HII Database Protocol directly.
+pub(super) trait MachineHii {}
+
+/// This firmware.
+pub(super) struct Firmware;
+
+impl MachineHii for Firmware {}
 
 /// What set and keyword set refuse here without --i-am-fine-to-brick-this-system.
 const SETUP_PASSWORD_WRITE: &str = "a write in a HiiDB that declares a setup password question, \
@@ -117,21 +138,48 @@ pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[SETUP_PASSWORD_WRITE, READ_O
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
 
-/// None: ilo and identify need Linux.
+/// apply-staged; ilo and identify need Linux.
 #[derive(Debug, Subcommand)]
-pub(super) enum PlatformCommands {}
+pub(super) enum PlatformCommands {
+    /// Apply the set that set staged from an OS for this boot, then reset the platform. The staged set's Boot####, which BootNext names, starts uefisettings.efi with this command before the OS
+    #[command(next_display_order = None)]
+    ApplyStaged {
+        /// The nonce that ties the staged set to its Boot####, 32 lowercase hexadecimal digits
+        nonce: String,
+    },
+}
 
 impl PlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
-        match *self {}
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
+        match self {
+            Self::ApplyStaged { nonce } => apply_staged(nonce),
+        }
     }
+}
+
+/// apply-staged: prints what applying the staged set of `nonce` did, then resets the platform cold,
+/// as UiApp does after a change that needs a reset (edk2-stable202608
+/// MdeModulePkg/Application/UiApp/FrontPage.c SetupResetReminder), so that the OS starts in a boot
+/// whose boot path holds no uefisettings.efi. ResetSystem() does not return (UEFI 2.11
+/// §8.5.1.1).
+fn apply_staged(nonce: &str) -> ! {
+    for line in HiiBackend::apply_staged(nonce) {
+        // nothing is left to report a failed print to, and the reset comes all the same
+        if let Err(error) = print_apply_staged_line(&line) {
+            debug!("failed to print {line:?}: {error}");
+        }
+    }
+    if let Err(error) = print_apply_staged_line("resetting the platform") {
+        debug!("failed to print the reset: {error}");
+    }
+    runtime::reset(ResetType::COLD, Status::SUCCESS, None)
 }
 
 /// variable-info, which variable info is too, and keyword; extract-db and dump-efivars write
 /// files, which this build does not.
 #[derive(Debug, Subcommand)]
 pub(super) enum HiiPlatformCommands {
-    /// Show the attributes and the size of an EFI variable, never its data
+    /// Show the attributes and the size of an EFI variable, and the EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access, never its data
     #[command(next_display_order = None)]
     VariableInfo {
         name: String,
@@ -144,7 +192,7 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match self {
             Self::VariableInfo { name, guid } => print_info(name, guid),
             Self::Keyword(command) => command.run(),
@@ -265,7 +313,12 @@ pub(super) struct HiiDbArgs {}
 
 impl HiiDbArgs {
     /// The HiiDB of this firmware, whatever `_efivars` and `_source` name.
-    pub(super) fn read(&self, _efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
+    pub(super) fn read(
+        &self,
+        _efivars: &EfivarSource,
+        _source: &HiiSourceArgs,
+        _hii: &impl MachineHii,
+    ) -> Result<Vec<u8>> {
         HiiBackend::export_hiidb()
     }
 }
@@ -313,6 +366,22 @@ impl VolatileArgs {
     }
 }
 
+/// None: set applies a question that its driver holds at once here, and stages nothing.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct StagingArgs {}
+
+impl StagingArgs {
+    pub(super) fn image(&self) -> Option<PathBuf> {
+        None
+    }
+
+    pub(super) fn esp(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
 /// get, in this firmware's HII database.
 pub(super) fn auto_get(
     question: &QuestionArgs,
@@ -320,6 +389,7 @@ pub(super) fn auto_get(
     selection: &SelectionArgs,
     _unsafe_operations: &HiiSourceUnsafeArgs,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
@@ -334,11 +404,13 @@ pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
     _selection: &SelectionArgs,
+    _staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
+    hii: &impl MachineHii,
 ) -> Result<()> {
     let (question, value) = target.target()?;
-    hii_set(question, &value, options, json, source)
+    hii_set(question, &value, options, json, source, hii)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
@@ -347,6 +419,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_using(question, value, None, options)
 }

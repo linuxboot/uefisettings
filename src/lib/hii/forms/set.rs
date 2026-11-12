@@ -21,7 +21,7 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
-use super::ami_access_level::AccessLevel;
+use super::assumed_var_store::CheckedVarStores;
 use super::conditions::ExpressionRefusal;
 use super::conditions::IncludedStates;
 use super::conditions::ReadOnlyCause;
@@ -454,7 +454,7 @@ pub(super) fn own_write<'a>(
 
 /// The value that set writes for `option` of the ONE_OF `question`, or why it has none: a number,
 /// which a ONE_OF stores.
-fn option_value(
+pub(super) fn option_value(
     question: &QuestionDescriptor,
     option: &AnswerOption,
 ) -> Result<TypeValue, ChangeValueError> {
@@ -491,7 +491,7 @@ fn number_value(question: &QuestionDescriptor, number: u64) -> Result<TypeValue,
 
 /// The value that `new_value` gives `question`, which takes no option: of a NUMERIC or CHECKBOX
 /// within its range, of a DATE or TIME a calendar date or a time.
-fn text_value(
+pub(super) fn text_value(
     question: &QuestionDescriptor,
     new_value: &str,
 ) -> Result<TypeValue, ChangeValueError> {
@@ -554,27 +554,41 @@ pub(crate) struct WrittenQuestion<'a> {
     pub(crate) volatile: bool,
 }
 
+/// A selected question's driver, which keeps the question's value in no variable (UEFI 2.11
+/// §33.2.5.6), with the value that set applies through it.
+pub(crate) trait DriverStore {
+    /// The store as set's errors name it: the selector of the question's package list, then how
+    /// the value is applied, such as `(its driver)`
+    fn label(&self) -> String;
+
+    /// Applies the value; returns the annotation of set's answer.
+    fn apply(&self) -> Result<String>;
+}
+
 /// Sets each of the `selected` questions, by the selector of its package list, to `answer`, in
 /// `variables`: an ORDERED_LIST to its items, each an option that select_option picks with
 /// `include`, another question to the text or to its option of one of the variations that
 /// chosen_option picks with `include`; writes a volatile variable only if `volatile` allows it,
-/// and returns a WrittenQuestion per selected question, in its order; fails with
-/// SelectionError::NotFound when nothing is selected, and with MixedKinds for questions of more
-/// than one QuestionKind.
+/// and returns a WrittenQuestion per selected question, in its order, and the annotation of each
+/// of `drivers`' answers, in theirs; fails with SelectionError::NotFound when nothing is selected,
+/// and with MixedKinds for questions of more than one QuestionKind.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
-/// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
-/// one question refuses leaves every variable unchanged; then it writes the system or wake-up time
+/// conditions read the VarStore bytes that `assumed` states, so that a value or a SET that one
+/// question refuses leaves every variable unchanged; then it writes the system or wake-up time
 /// of each question of EFI Date/Time Storage, in question order, then each variable once, with
-/// the changes of every question to it (batched_writes), in order, and stops at the first write
-/// that fails, with its error unchanged if it is the only write, else with NotSetEverywhere.
+/// the changes of every question to it (batched_writes), in order, then applies each of the
+/// `drivers`' values, and stops at the first store that fails, with its error unchanged if it is
+/// the only store, else with NotSetEverywhere. The drivers come after the variables because no
+/// browser answers a driver's BrowserCallback(), so the variables written first are the only view
+/// its Callback()s have of the values of this set.
 /// Through efivarfs it refuses, before any write, two variables of one efivar file
 /// (check_efivar_files). It checks `unsafe_operations` after all of these refusals, right before
 /// the first write, and returns the operations that it lifted, with the error of a failed write
 /// too (LiftedOperations).
 #[expect(
     clippy::too_many_arguments,
-    reason = "set's inputs: the question, its matches, the value, how to pick an option, and the \
-              variables to read and write"
+    reason = "set's inputs: the question, its matches, the value, how to pick an option, the \
+              variables to read and write, and the drivers that keep the values of the others"
 )]
 pub(crate) fn set_questions<'a>(
     question: &str,
@@ -582,12 +596,13 @@ pub(crate) fn set_questions<'a>(
     answer: NewAnswer<'_>,
     include: IncludedStates,
     reader: &mut EfivarReader,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     volatile: VolatileWrites,
     unsafe_operations: PendingOperations,
     variables: &WithholdingVariables<impl FirmwareVariables>,
-) -> Result<(Vec<WrittenQuestion<'a>>, Vec<UnsafeOperation>)> {
-    if selected.is_empty() {
+    drivers: &[&dyn DriverStore],
+) -> Result<(Vec<WrittenQuestion<'a>>, Vec<String>, Vec<UnsafeOperation>)> {
+    if selected.is_empty() && drivers.is_empty() {
         return Err(SelectionError::NotFound {
             question: question.to_owned(),
         }
@@ -598,8 +613,7 @@ pub(crate) fn set_questions<'a>(
     let mut plans = Vec::new();
     let mut given = Vec::new();
     for &(selector, descriptor) in selected {
-        let (plan, written) =
-            plan_question(descriptor, answer, include, through, reader, access_level)?;
+        let (plan, written) = plan_question(descriptor, answer, include, through, reader, assumed)?;
         plans.push((selector, plan));
         given.push(written);
     }
@@ -638,13 +652,16 @@ pub(crate) fn set_questions<'a>(
     let stores: Vec<BatchedStore<'_, '_>> = times
         .into_iter()
         .chain(batch.iter().map(BatchedStore::Variable))
+        .chain(drivers.iter().map(|&driver| BatchedStore::Driver(driver)))
         .collect();
     let mut written = Vec::new();
+    let mut annotations = Vec::new();
     let mut unwritten = stores.iter();
     while let Some(store) = unwritten.next() {
         let error = match store.write(&variables) {
-            Ok(label) => {
+            Ok((label, annotation)) => {
                 written.push(label);
+                annotations.extend(annotation);
                 continue;
             }
             Err(error) => error,
@@ -668,7 +685,7 @@ pub(crate) fn set_questions<'a>(
         };
         return Err(LiftedOperations::attach(lifted, error.into()));
     }
-    Ok((written_questions, lifted))
+    Ok((written_questions, annotations, lifted))
 }
 
 /// The WritePlan that gives `question` `answer` through variables of `through`, as set_questions
@@ -679,7 +696,7 @@ fn plan_question<'a>(
     include: IncludedStates,
     through: (VariableReach, VariableInterface),
     reader: &mut EfivarReader,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
 ) -> Result<(WritePlan<'a>, Written<'a>)> {
     match (&question.input, answer) {
         (TextInput::CrossReference, NewAnswer::Items(_) | NewAnswer::Text { .. }) => {
@@ -721,7 +738,7 @@ fn plan_question<'a>(
                     (NewValue::Option(option), Written::Option(option))
                 }
             };
-            let plan = WritePlan::new(question, value, through, reader, access_level)?;
+            let plan = WritePlan::new(question, value, through, reader, assumed)?;
             Ok((plan, written))
         }
     }
@@ -729,7 +746,10 @@ fn plan_question<'a>(
 
 /// Refuses `selected`, the questions that the text `question` selects, by selector, unless they
 /// are all of one QuestionKind: set gives one value to all of them.
-fn check_one_kind(question: &str, selected: &[(&str, &QuestionDescriptor)]) -> Result<()> {
+pub(crate) fn check_one_kind(
+    question: &str,
+    selected: &[(&str, &QuestionDescriptor)],
+) -> Result<()> {
     let mut kinds: Vec<(QuestionKind, Vec<String>)> = Vec::new();
     for &(selector, descriptor) in selected {
         let kind = QuestionKind::of(descriptor.opcode)
@@ -814,6 +834,7 @@ impl fmt::Display for Outcome {
 #[cfg(test)]
 #[cfg(efivar_dumps)]
 mod set_questions_tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
 
     use super::super::ifr_fixtures::*;
@@ -915,16 +936,7 @@ mod set_questions_tests {
         new_value: &str,
         texts: &[&str],
     ) -> std::result::Result<Vec<Option<String>>, String> {
-        set_pending(
-            variables,
-            selected,
-            NewAnswer::Text {
-                text: new_value,
-                variations: &texts.iter().map(|text| text.to_string()).collect(),
-            },
-            PendingOperations::new(UnsafeOperations::Refuse),
-        )
-        .map(|(written, _)| {
+        set_through_drivers(variables, selected, new_value, texts, &[]).map(|(written, _)| {
             written
                 .into_iter()
                 .map(|question| match question.given {
@@ -933,16 +945,40 @@ mod set_questions_tests {
                 })
                 .collect()
         })
+    }
+
+    /// set_questions of PROMPT to `new_value`, or to an option of the texts `texts`, in
+    /// `variables`, then through `drivers`: its answer, or its error as the CLI prints it.
+    fn set_through_drivers<'a>(
+        variables: &impl FirmwareVariables,
+        selected: &[(&str, &'a QuestionDescriptor)],
+        new_value: &str,
+        texts: &[&str],
+        drivers: &[&dyn DriverStore],
+    ) -> std::result::Result<(Vec<WrittenQuestion<'a>>, Vec<String>), String> {
+        set_pending(
+            variables,
+            selected,
+            NewAnswer::Text {
+                text: new_value,
+                variations: &texts.iter().map(|text| text.to_string()).collect(),
+            },
+            PendingOperations::new(UnsafeOperations::Refuse),
+            drivers,
+        )
+        .map(|(written, annotations, _)| (written, annotations))
         .map_err(|error| format!("{error:#}"))
     }
 
-    /// set_questions of PROMPT to `answer` in `variables`, with the unsafe operations `pending`.
+    /// set_questions of PROMPT to `answer` in `variables`, then through `drivers`, with the
+    /// unsafe operations `pending`.
     fn set_pending<'a>(
         variables: &impl FirmwareVariables,
         selected: &[(&str, &'a QuestionDescriptor)],
         answer: NewAnswer<'_>,
         pending: PendingOperations,
-    ) -> Result<(Vec<WrittenQuestion<'a>>, Vec<UnsafeOperation>)> {
+        drivers: &[&dyn DriverStore],
+    ) -> Result<(Vec<WrittenQuestion<'a>>, Vec<String>, Vec<UnsafeOperation>)> {
         // no question here has a WRITE expression, whose GETs and merges would read
         let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
             variables.reach(),
@@ -954,10 +990,11 @@ mod set_questions_tests {
             answer,
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             pending,
             &WithholdingVariables::new(variables, WithheldBytes::default()),
+            drivers,
         )
     }
 
@@ -1106,6 +1143,43 @@ mod set_questions_tests {
         }
     }
 
+    /// A driver of a question of the selector "D", which records each value it applies.
+    #[derive(Default)]
+    struct RecordingStore {
+        applied: Cell<usize>,
+    }
+
+    impl DriverStore for RecordingStore {
+        fn label(&self) -> String {
+            "D (its driver)".to_owned()
+        }
+
+        fn apply(&self) -> Result<String> {
+            self.applied.set(self.applied.get() + 1);
+            Ok(" <applied>".to_owned())
+        }
+    }
+
+    /// set stops at a failed variable write before the drivers too: a driver after it is not
+    /// attempted, and never applies its value.
+    #[test]
+    fn a_failed_variable_write_leaves_the_drivers_after_it_unapplied() {
+        let mut variables = MemoryVariables::default();
+        let a = checkbox_on_store(failing_var_store("A", WRITE_ERROR, &mut variables));
+        let driver = RecordingStore::default();
+        let in_a = label("A");
+
+        assert_eq!(
+            set_through_drivers(&variables, &[("A", &a)], "1", &[], &[&driver]).map(drop),
+            Err(format!(
+                "question \"Prompt\" was not set everywhere: write failed (in {in_a}); written in: \
+                 none; not attempted: D (its driver)"
+            )),
+            "a failed write of A before the driver of D"
+        );
+        assert_eq!(driver.applied.get(), 0, "the driver of D never applied");
+    }
+
     #[test]
     fn the_failed_write_of_a_single_match_is_its_error() {
         let mut variables = MemoryVariables::default();
@@ -1148,7 +1222,7 @@ mod set_questions_tests {
                 pending.add(operation.clone());
             }
 
-            let error = set_pending(&variables, &selected, ONE, pending)
+            let error = set_pending(&variables, &selected, ONE, pending, &[])
                 .map(drop)
                 .expect_err("A fails");
 
@@ -1662,10 +1736,11 @@ mod set_questions_tests {
                 },
                 IncludedStates::empty(),
                 &mut reader,
-                None,
+                CheckedVarStores::NONE,
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, withheld),
+                &[],
             )
             .map(drop)
             .map_err(|error| format!("{error:#}"));
@@ -1927,7 +2002,7 @@ mod set_questions_tests {
 
             let selected = [("slash", &slash), ("bang", &bang)];
 
-            let got = set_pending(&variables, &selected, ONE, pending)
+            let got = set_pending(&variables, &selected, ONE, pending, &[])
                 .map(drop)
                 .map_err(|error| format!("{error:#}"));
 
@@ -2991,10 +3066,11 @@ mod date_time_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, WithheldBytes::default()),
+            &[],
         )
         .map(drop)
         .map_err(|error| format!("{error:#}"));
@@ -3023,10 +3099,11 @@ mod date_time_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, WithheldBytes::default()),
+            &[],
         )
         .map(drop)
         .map_err(|error| format!("{error:#}"));
@@ -3148,10 +3225,11 @@ mod time_storage_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
+            &[],
         )
         .map(drop)
         .map_err(|error| format!("{error:#}"));
@@ -3580,12 +3658,13 @@ mod time_storage_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             volatile,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, withheld),
+            &[],
         )
-        .map(|(written, _)| written.iter().map(|question| question.volatile).collect())
+        .map(|(written, _, _)| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"));
         let calls = services.calls.borrow()[calls_before..].to_vec();
         (

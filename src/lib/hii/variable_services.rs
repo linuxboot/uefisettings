@@ -23,6 +23,7 @@ use uefi::runtime;
 use uefi::runtime::VariableVendor;
 use uefi::CString16;
 use uefi::Status;
+use zeroize::Zeroizing;
 
 use crate::efi_variables::globals::platform_lang;
 use crate::efi_variables::walk_variable_names;
@@ -41,9 +42,11 @@ use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::created_variable_bytes;
 use crate::hii::variables::efivar_parts;
 use crate::hii::variables::modify_variable_bytes;
+use crate::hii::variables::read_zeroing;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::GetVariableCall;
 use crate::hii::variables::MissingVariable;
 use crate::hii::variables::UnreadVariables;
 use crate::hii::variables::VariableAttributes;
@@ -82,6 +85,7 @@ impl EfivarSource {
 
 /// The variables of the firmware that the UEFI Shell runs on, every one of them, as boot
 /// services still run.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct VariableServices;
 
 impl VariableServices {
@@ -184,6 +188,8 @@ impl VariableInfoSource for VariableServices {
     /// of its data: as every variable holds one at least (UEFI 2.10 §8.2.3), the firmware
     /// returns EFI_BUFFER_TOO_SMALL with the attributes and the size (§8.2.1), and
     /// uefi::runtime::get_variable drops the attributes then.
+    /// Of a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, it then reads the data, whose
+    /// metadata only the data holds (UEFI 2.11 §8.2.1), for VariableInfo::from_data.
     fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo> {
         let (variable_name, variable_vendor) = uefi_key(key)?;
         let system_table = uefi::table::system_table_raw().context("no system table")?;
@@ -213,10 +219,18 @@ impl VariableInfoSource for VariableServices {
                      attributes"
                 ))
             }
+            Status::BUFFER_TOO_SMALL | Status::SUCCESS
+                if VariableAttributes::from_bits_retain(attributes.bits())
+                    .contains(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS) =>
+            {
+                let (data, attributes) = get_variable(key)?;
+                Ok(VariableInfo::from_data(key, attributes.bits(), &data))
+            }
             Status::BUFFER_TOO_SMALL | Status::SUCCESS => Ok(VariableInfo {
                 variable: key.to_string(),
                 attributes: attributes.bits(),
                 size,
+                metadata: None,
             }),
             Status::NOT_FOUND => Err(VariableNotFound(key.clone()).into()),
             status => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
@@ -230,12 +244,12 @@ impl VariableData for VariableServices {
     }
 
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
-        let (data, attributes) = match get_variable(key) {
+        let (mut data, attributes) = match get_variable(key) {
             Err(error) if error.is::<VariableNotFound>() => return Ok(None),
             result => result?,
         };
         let attributes = VariableAttributes::from_bits_retain(attributes.bits());
-        VariableContents::new(attributes, data.into())
+        VariableContents::new(attributes, std::mem::take(&mut *data))
             .map(Some)
             .with_context(|| format!("GetVariable() of EFI variable {key}"))
     }
@@ -253,6 +267,14 @@ impl VariableData for VariableServices {
                 status => anyhow!("SetVariable() of EFI variable {key}: {status:?}"),
             },
         )
+    }
+
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        let (variable_name, vendor) = uefi_key(key)?;
+        runtime::delete_variable(&variable_name, &vendor).map_err(|error| match error.status() {
+            Status::NOT_FOUND => VariableNotFound(key.clone()).into(),
+            status => anyhow!("SetVariable() deleting EFI variable {key}: {status:?}"),
+        })
     }
 }
 
@@ -275,12 +297,22 @@ impl VariableStorageInfo for VariableServices {
     }
 }
 
-/// GetVariable() of `key`: its data and attributes, or VariableNotFound.
-fn get_variable(key: &VariableKey) -> Result<(Box<[u8]>, runtime::VariableAttributes)> {
+/// GetVariable() of `key`: its data, in a buffer that zeroes on drop (read_zeroing), and
+/// attributes, or VariableNotFound.
+fn get_variable(key: &VariableKey) -> Result<(Zeroizing<Vec<u8>>, runtime::VariableAttributes)> {
     let (name, vendor) = uefi_key(key)?;
-    runtime::get_variable_boxed(&name, &vendor).map_err(|error| match error.status() {
-        Status::NOT_FOUND => VariableNotFound(key.clone()).into(),
-        status => anyhow!("GetVariable() of EFI variable {key}: {status:?}"),
+    read_zeroing(key, |buffer| {
+        match runtime::get_variable(&name, &vendor, buffer) {
+            Ok((data, attributes)) => Ok(GetVariableCall::Read {
+                size: data.len(),
+                attributes,
+            }),
+            Err(error) => match (error.status(), *error.data()) {
+                (Status::BUFFER_TOO_SMALL, Some(size)) => Ok(GetVariableCall::TooSmall(size)),
+                (Status::NOT_FOUND, _) => Err(VariableNotFound(key.clone()).into()),
+                (status, _) => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
+            },
+        }
     })
 }
 

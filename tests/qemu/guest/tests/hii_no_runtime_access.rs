@@ -47,9 +47,16 @@ fn check_box_answer() -> String {
     format!("{NO_CONFIG_ACCESS} <IFR default: 1>")
 }
 
-/// Why a condition with `op` on question `id`, on DriverSample's variable, is not evaluated.
-fn unread(op: &str, id: u16) -> String {
-    format!("{op} of question {id:#06x}: {NO_CONFIG_ACCESS}")
+/// Why a condition with `op` on question `id`, on DriverSample's variable, is not evaluated,
+/// and the `--assume-var-store` that states the byte at `offset` that the question reads.
+fn unread(op: &str, id: u16, offset: usize) -> String {
+    let reason = NO_CONFIG_ACCESS
+        .strip_suffix('>')
+        .expect("NO_CONFIG_ACCESS ends with '>'");
+    format!(
+        "{op} of question {id:#06x}: {reason}; --assume-var-store \
+         MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d+{offset}=<HEX of 1 byte> states it>"
+    )
 }
 
 /// The answers of the listings of [`CHECK_BOX`]: Vfr.vfr grays out or suppresses the first
@@ -59,13 +66,13 @@ fn check_box_answers() -> [String; 2] {
         format!(
             "{} <selectable or grayed-out or suppressed: {}; {}>",
             check_box_answer(),
-            unread("EFI_IFR_QUESTION_REF1", 1),
-            unread("EFI_IFR_EQ_ID_VAL", 1)
+            unread("EFI_IFR_QUESTION_REF1", 1, 93),
+            unread("EFI_IFR_EQ_ID_VAL", 1, 93)
         ),
         format!(
             "{} <selectable or suppressed: {}>",
             check_box_answer(),
-            unread("EFI_IFR_EQ_ID_VAL", 2)
+            unread("EFI_IFR_EQ_ID_VAL", 2, 118)
         ),
     ]
 }
@@ -101,7 +108,7 @@ fn list_questions_reports_numeric_and_one_of_defaults() {
     // The numeric is in a grayoutif on two questions on the variable.
     let numeric_states = format!(
         " <selectable or grayed-out: {}>",
-        unread("EFI_IFR_EQ_ID_VAL", 0x0c)
+        unread("EFI_IFR_EQ_ID_VAL", 0x0c, 82)
     );
     for (name, default, states) in [
         (NUMERIC, "18", numeric_states.as_str()),

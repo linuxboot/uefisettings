@@ -29,8 +29,11 @@ mod capsule_delivery;
 #[cfg(variable_data)]
 mod capsule_result;
 pub(crate) mod enhanced_authenticated;
-#[cfg(variable_data)]
+#[cfg(any(variable_data, variable_info))]
 mod json_bytes;
+
+#[cfg(any(variable_data, variable_info))]
+use std::fmt;
 
 #[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
@@ -93,6 +96,8 @@ pub use capsule_result::ResultName;
 pub use capsule_result::Undecoded;
 #[cfg(configuration_tables)]
 pub(crate) use capsule_result::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
+#[cfg(variable_info)]
+pub use enhanced_authenticated::MetadataInfo;
 #[cfg(variable_data)]
 pub use json_bytes::TextOrHex;
 
@@ -114,7 +119,22 @@ use crate::hii::VariableInterface;
 use crate::hii::VariableKey;
 
 #[cfg(variable_data)]
+pub(crate) mod boot_manager;
+#[cfg(variable_data)]
+pub(crate) mod device_path;
+#[cfg(variable_data)]
 pub(crate) mod globals;
+#[cfg(variable_data)]
+pub(crate) mod key_option;
+#[cfg(variable_data)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "only the Linux and Windows builds stage a set in a load option"
+    )
+)]
+pub(crate) mod load_option;
 #[cfg(variable_data)]
 pub(crate) mod secure_boot_mode;
 
@@ -130,6 +150,41 @@ fn is_gmt_time_stamp(time_stamp: &[u8; EFI_TIME_SIZE]) -> bool {
     gmt_fields.iter().all(|&byte| byte == 0)
 }
 
+/// An EFI_TIME in GMT (is_gmt_time_stamp), as the TimeStamp of an authentication descriptor holds
+/// it.
+#[cfg(any(variable_data, variable_info))]
+#[derive(Debug, Clone, Copy)]
+struct GmtTime<'a>(&'a [u8; EFI_TIME_SIZE]);
+
+#[cfg(any(variable_data, variable_info))]
+impl GmtTime<'_> {
+    /// Its Year, Month, Day, Hour, Minute and Second, the fields that a time in GMT sets, in the
+    /// order that orders them chronologically.
+    fn fields(self) -> (u16, u8, u8, u8, u8, u8) {
+        let [y0, y1, month, day, hour, minute, second, ..] = *self.0;
+        (
+            u16::from_le_bytes([y0, y1]),
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        )
+    }
+}
+
+/// As YYYY-MM-DDTHH:MM:SSZ.
+#[cfg(any(variable_data, variable_info))]
+impl fmt::Display for GmtTime<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (year, month, day, hour, minute, second) = self.fields();
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+        )
+    }
+}
+
 /// EFI_JSON_CAPSULE_ID_GUID, the CapsuleGuid of a JSON capsule (UEFI 2.11 §23.5.1), which the
 /// result of its processing names too (§8.5.6.1.3).
 #[cfg(any(capsule_delivery, configuration_tables, variable_data))]
@@ -140,12 +195,28 @@ const EFI_JSON_CAPSULE_ID_GUID: Guid = Guid {
     data4: [0xbf, 0x4a, 0xde, 0x5e, 0x25, 0x2d, 0x61, 0xae],
 };
 
+/// The vendor GUID of uefisettings' own EFI variables.
+#[cfg(variable_data)]
+pub(crate) const UEFISETTINGS_VENDOR_GUID: Guid = Guid {
+    data1: 0xdd16_f539,
+    data2: 0x09ed,
+    data3: 0x41b9,
+    data4: [0x8b, 0x64, 0xd8, 0x5d, 0x6c, 0xd9, 0x3a, 0x8e],
+};
+
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
 /// vendor GUID.
 #[cfg(variable_names)]
 pub(crate) trait VariableNames {
     /// Every variable these reach, in no particular order.
     fn variable_names(&self) -> Result<Vec<VariableKey>>;
+}
+
+#[cfg(variable_names)]
+impl<T: VariableNames + ?Sized> VariableNames for &T {
+    fn variable_names(&self) -> Result<Vec<VariableKey>> {
+        (**self).variable_names()
+    }
 }
 
 /// What one GetNextVariableName() call (UEFI 2.10 §8.2.2) did.
@@ -252,6 +323,25 @@ pub struct VariableInfo {
     pub attributes: u32,
     /// The size of its data, in bytes
     pub size: usize,
+    /// The EFI_VARIABLE_AUTHENTICATION_3 metadata before its data, if it has
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 §8.2.1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MetadataInfo>,
+}
+
+#[cfg(variable_info)]
+impl VariableInfo {
+    /// The VariableInfo of `key` from the `attributes` and `data` that GetVariable() returns
+    /// (UEFI 2.10 §8.2.1): their size, and the metadata that starts `data` if `attributes` say so
+    /// (MetadataInfo::of), but never `data`.
+    pub(crate) fn from_data(key: &VariableKey, attributes: u32, data: &[u8]) -> Self {
+        Self {
+            variable: key.to_string(),
+            attributes,
+            size: data.len(),
+            metadata: MetadataInfo::of(attributes, data),
+        }
+    }
 }
 
 /// GetVariable() (UEFI 2.10 §8.2.1) with the data, and SetVariable() (§8.2.3): a variable that a
@@ -265,6 +355,35 @@ pub(crate) trait VariableData {
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>>;
     /// Sets `key` to `contents`, creating it if missing.
     fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()>;
+    /// Deletes `key`, as SetVariable() without data does (UEFI 2.11 §8.2.3); fails with
+    /// VariableNotFound if the backend reaches no such variable.
+    #[cfg_attr(
+        not(any(target_os = "uefi", test)),
+        allow(
+            dead_code,
+            reason = "only the UEFI Shell build restores a FormSet's stores"
+        )
+    )]
+    fn delete_variable(&self, key: &VariableKey) -> Result<()>;
+}
+
+#[cfg(variable_data)]
+impl<T: VariableData + ?Sized> VariableData for &T {
+    fn interface(&self) -> VariableInterface {
+        (**self).interface()
+    }
+
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        (**self).variable_data(key)
+    }
+
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        (**self).set_variable(key, contents)
+    }
+
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        (**self).delete_variable(key)
+    }
 }
 
 /// What SetVariable() returned, but EFI_SUCCESS, for a Secure Boot Mode transition that the
@@ -316,6 +435,11 @@ impl VariableContents {
 
     pub(crate) fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Its data, moved out.
+    pub(crate) fn into_data(self) -> Vec<u8> {
+        self.data
     }
 }
 
@@ -756,6 +880,7 @@ mod tests {
             variable: "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d".to_string(),
             attributes: 7,
             size: 220,
+            metadata: None,
         };
 
         assert_eq!(

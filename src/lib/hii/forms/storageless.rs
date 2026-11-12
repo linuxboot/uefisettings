@@ -20,13 +20,18 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
+use super::conditions::enclosing_form_set;
+use super::conditions::parse_question_header;
 use super::conditions::question_expression;
 use super::conditions::question_value_expression;
 use super::conditions::QuestionExpression;
 use super::conditions::VALUE_MAKES_READ_ONLY;
 use super::question_values::ListedQuestion;
+use super::question_values::ValueQuestion;
+use super::walk_scopes;
 use super::IFROperation;
 use super::QuestionFlags;
+use super::Walk;
 use crate::hii::variables::VariableReach;
 
 /// What a question without a VarStore declares for its value.
@@ -40,6 +45,12 @@ pub(crate) struct StoragelessQuestion {
     callback: bool,
     /// An EFI_IFR_VALUE, which gives the value and makes the question read-only
     value: bool,
+    /// The name of the op of a DATE, TIME, ORDERED_LIST or STRING, whose value uefisettings
+    /// exchanges with no driver's CallBack(); None for a ONE_OF, NUMERIC or CHECKBOX
+    undecoded: Option<&'static str>,
+    /// With EFI_IFR_FLAG_CALLBACK, the op of another question of its FormSet that has its
+    /// QuestionId, by which alone its driver's CallBack() tells questions apart; None if none has
+    shared_question_id: Option<&'static str>,
 }
 
 impl StoragelessQuestion {
@@ -51,13 +62,33 @@ impl StoragelessQuestion {
         if listed.time_storage().is_some() {
             return None;
         }
+        let undecoded = match listed {
+            ListedQuestion::Value(
+                ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) | ValueQuestion::CheckBox(_),
+            ) => None,
+            ListedQuestion::Value(ValueQuestion::DateTime(_))
+            | ListedQuestion::OrderedList(_)
+            | ListedQuestion::Ref(_)
+            | ListedQuestion::String(_) => Some(op.op_code.spec_name()),
+        };
         let header = listed.header();
+        let callback = header.flags().contains(QuestionFlags::CALLBACK);
         (header.var_store_id == 0).then(|| Self {
             read: question_expression(question, QuestionExpression::Read).is_some(),
             write: question_expression(question, QuestionExpression::Write).is_some(),
-            callback: header.flags().contains(QuestionFlags::CALLBACK),
+            callback,
             value: question_value_expression(&question.borrow()).is_some(),
+            undecoded,
+            shared_question_id: callback
+                .then(|| sharing_question_id(question, header.question_id))
+                .flatten(),
         })
+    }
+
+    /// Whether another question of its FormSet has its QuestionId, so that no CallBack() for it
+    /// reaches its driver (StoragelessRefusal::CallbackSharedQuestionId).
+    pub(crate) fn shares_question_id(self) -> bool {
+        self.shared_question_id.is_some()
     }
 
     /// How get (`Read`) or set (`Write`) reaches the value.
@@ -88,21 +119,64 @@ impl StoragelessQuestion {
 
     /// Why get (`Read`) or set (`Write`) on a backend of `reach` gives or takes no value
     /// without the expression; None if the expression alone does: a route through CallBack()
-    /// waits for a caller that calls it.
+    /// waits for a caller that calls it, which none does for a DATE, TIME, ORDERED_LIST or
+    /// STRING.
     pub(crate) fn refusal(
         self,
         expression: QuestionExpression,
         reach: VariableReach,
     ) -> Option<StoragelessRefusal> {
-        match self.route(expression) {
-            Ok(StoragelessRoute::Expression { callback: false } | StoragelessRoute::Value) => None,
-            Ok(StoragelessRoute::Expression { callback: true }) => {
+        match (
+            self.route(expression),
+            self.undecoded,
+            self.shared_question_id,
+        ) {
+            (
+                Ok(StoragelessRoute::Expression { callback: false } | StoragelessRoute::Value),
+                _,
+                _,
+            ) => None,
+            (
+                Ok(
+                    StoragelessRoute::Expression { callback: true }
+                    | StoragelessRoute::DriverCallback,
+                ),
+                Some(op),
+                _,
+            ) => Some(StoragelessRefusal::CallbackUndecoded(op)),
+            (
+                Ok(
+                    StoragelessRoute::Expression { callback: true }
+                    | StoragelessRoute::DriverCallback,
+                ),
+                None,
+                Some(op),
+            ) => Some(StoragelessRefusal::CallbackSharedQuestionId(op)),
+            (Ok(StoragelessRoute::Expression { callback: true }), None, None) => {
                 Some(StoragelessRefusal::CallbackDecides(expression, reach))
             }
-            Ok(StoragelessRoute::DriverCallback) => Some(StoragelessRefusal::DriverHeld(reach)),
-            Err(refusal) => Some(refusal),
+            (Ok(StoragelessRoute::DriverCallback), None, None) => {
+                Some(StoragelessRefusal::DriverHeld(reach))
+            }
+            (Err(refusal), _, _) => Some(refusal),
         }
     }
+}
+
+/// The op of the first question of the FormSet of `question` other than `question` whose
+/// QuestionId is `id`.
+fn sharing_question_id(question: &Rc<RefCell<IFROperation>>, id: u16) -> Option<&'static str> {
+    let form_set = enclosing_form_set(&question.borrow())?;
+    let mut shared = None;
+    walk_scopes(std::slice::from_ref(&form_set), (), |op, ()| {
+        let other = !Rc::ptr_eq(op, question)
+            && parse_question_header(&op.borrow()).is_some_and(|header| header.question_id == id);
+        if other && shared.is_none() {
+            shared = Some(op.borrow().op_code.spec_name());
+        }
+        Walk::Enter(())
+    });
+    shared
 }
 
 /// find_corresponding_varstore's error for a question without a VarStore, which get and set
@@ -172,14 +246,34 @@ pub(crate) enum StoragelessRefusal {
     /// value before WRITE (UEFI 2.11 §35.5.4)
     #[error("{}", CallbackDecides(*.0, *.1))]
     CallbackDecides(QuestionExpression, VariableReach),
+    /// get or set of a DATE, TIME, ORDERED_LIST or STRING, named by its op, with
+    /// EFI_IFR_FLAG_CALLBACK and no expression that alone reaches the value: uefisettings calls no
+    /// CallBack() for it
+    #[error(
+        "question has no VarStore, and its driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() \
+         keeps or may change its value (UEFI 2.11 §33.2.5.6, §35.5.4), which uefisettings \
+         exchanges with CallBack() only for an EFI_IFR_ONE_OF, EFI_IFR_NUMERIC or \
+         EFI_IFR_CHECKBOX, not for an {0}"
+    )]
+    CallbackUndecoded(&'static str),
+    /// get or set of a question with EFI_IFR_FLAG_CALLBACK whose QuestionId another question of
+    /// its FormSet, named by its op, also has: a CallBack() names its question only by
+    /// QuestionId, so uefisettings calls none for it
+    #[error(
+        "question has no VarStore, and its driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() \
+         keeps or may change its value (UEFI 2.11 §33.2.5.6, §35.5.4) by its QuestionId, which an \
+         {0} of its FormSet also has, though a QuestionId is \"The unique value that identifies \
+         the particular question\" (§33.3.8.2.2), so uefisettings calls no CallBack() for it"
+    )]
+    CallbackSharedQuestionId(&'static str),
     /// set of a question with an EFI_IFR_VALUE
     #[error("{}", VALUE_MAKES_READ_ONLY)]
     ReadOnly,
     #[cfg_attr(
-        not(test),
+        not(any(target_os = "uefi", test)),
         expect(
             dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
+            reason = "only the UEFI Shell build calls a driver's CallBack()"
         )
     )]
     #[error(
@@ -189,10 +283,10 @@ pub(crate) enum StoragelessRefusal {
     )]
     NoConfigAccess,
     #[cfg_attr(
-        not(test),
+        not(any(target_os = "uefi", test)),
         expect(
             dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
+            reason = "only the UEFI Shell build calls a driver's CallBack()"
         )
     )]
     /// get of a question on StoragelessRoute::DriverCallback whose
@@ -204,66 +298,15 @@ pub(crate) enum StoragelessRefusal {
     )]
     RetrieveFailed { status: String },
     #[cfg_attr(
-        not(test),
+        not(any(target_os = "uefi", test)),
         expect(
             dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
+            reason = "only the UEFI Shell build calls a driver's CallBack()"
         )
     )]
     /// `status`: the EFI_STATUS that CallBack(EFI_BROWSER_ACTION_CHANGING) returned
     #[error("its driver's CallBack(EFI_BROWSER_ACTION_CHANGING) refused the value: {status}")]
     ChangingRefused { status: String },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
-        )
-    )]
-    /// `status`: the EFI_STATUS of the read of VarStore `var_store_id` before the first CallBack()
-    #[error("cannot snapshot store {var_store_id:#06x}: {status}")]
-    SnapshotFailed { var_store_id: u16, status: String },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
-        )
-    )]
-    /// The VarStores of the FormSet that differ after the CallBack() sequence, and their restore
-    #[error(
-        "the Callback sequence changed stores of the FormSet: {}; {restore}",
-        .stores.join(", ")
-    )]
-    StoresChanged {
-        stores: Vec<String>,
-        restore: StoreRestore,
-    },
-}
-
-/// How restoring the VarStores that a CallBack() sequence changed ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
-    )
-)]
-pub(crate) enum StoreRestore {
-    /// Every store reads back as before the sequence
-    Verified,
-    /// Why a restore failed
-    Failed(String),
-}
-
-impl fmt::Display for StoreRestore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Verified => f.write_str("restored and verified"),
-            Self::Failed(reason) => write!(f, "restore failed: {reason}"),
-        }
-    }
 }
 
 /// StoragelessRefusal::DriverHeld's text: where the question's value is, and why this run does not
@@ -303,14 +346,14 @@ impl fmt::Display for CallbackDecides {
 }
 
 /// Why a run of `reach` calls no CallBack(): after ExitBootServices() no EFI device-handle-based
-/// protocol may be used; uefisettings.efi does not call it yet.
+/// protocol may be used; in uefisettings.efi only get, without --no-efivars, and set call it.
 fn no_callback(reach: VariableReach) -> &'static str {
     match reach {
         VariableReach::Runtime => {
             ", and after ExitBootServices() no EFI device-handle-based protocol may be used (UEFI \
              2.11 §7.4.6); use uefisettings.efi in the UEFI Shell"
         }
-        VariableReach::BootServices => ", which uefisettings.efi does not call yet",
+        VariableReach::BootServices => ", which only get (without --no-efivars) and set call",
     }
 }
 
@@ -646,6 +689,127 @@ mod tests {
         }
     }
 
+    /// A DATE, TIME, ORDERED_LIST or STRING without a VarStore flagged EFI_IFR_FLAG_CALLBACK,
+    /// with or without a READ and a WRITE expression, is refused by its op through either
+    /// reach: its driver's CallBack() keeps or may change its value, and uefisettings calls none
+    /// for it.
+    #[test]
+    fn callback_dates_times_ordered_lists_and_strings_are_refused_by_their_op() {
+        use QuestionExpression::Read;
+        use QuestionExpression::Write;
+        let header = question_header_with(1, 3, 0, 0, QuestionFlags::CALLBACK.bits());
+        let cases = [
+            ("EFI_IFR_DATE", DATE, vec![0x00], Vec::new()),
+            ("EFI_IFR_TIME", TIME, vec![0x00], Vec::new()),
+            (
+                "EFI_IFR_ORDERED_LIST",
+                ORDERED_LIST,
+                vec![4, 0x00],
+                one_of_option(5, 0x00, &[1]),
+            ),
+            // MinSize 0, MaxSize 4, no Flags
+            ("EFI_IFR_STRING", STRING, vec![0, 4, 0x00], Vec::new()),
+        ];
+        for (name, op_code, fields, option) in cases {
+            for expressions in [false, true] {
+                let data = [header.clone(), fields.clone()].concat();
+                let read_write = match expressions {
+                    true => [expression_of(READ), expression_of(WRITE)].concat(),
+                    false => Vec::new(),
+                };
+                let question = [
+                    operation(op_code, true, &data),
+                    option.clone(),
+                    read_write,
+                    END.to_vec(),
+                ]
+                .concat();
+                let root = parse_form_set(&[form(1, &[question])]);
+                let question = find_op(&root, &data).expect("the question");
+                let question = StoragelessQuestion::of(&question)
+                    .unwrap_or_else(|| panic!("{name}: classified as having a VarStore"));
+                for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+                    let want = Some(StoragelessRefusal::CallbackUndecoded(name));
+                    assert_eq!(
+                        (
+                            question.refusal(Read, reach),
+                            question.refusal(Write, reach)
+                        ),
+                        (want.clone(), want),
+                        "{name}, READ and WRITE {expressions}, through {reach:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A ONE_OF without a VarStore flagged EFI_IFR_FLAG_CALLBACK, with or without a READ and a
+    /// WRITE expression, whose QuestionId a PASSWORD of its FormSet also has, is refused through
+    /// either reach, naming the PASSWORD: a CallBack() names its question only by QuestionId.
+    /// One whose QuestionId no other question has, or that has no EFI_IFR_FLAG_CALLBACK, is
+    /// refused as before; a PASSWORD is no StoragelessQuestion.
+    #[test]
+    fn callback_questions_that_share_their_question_id_are_refused() {
+        use QuestionExpression::Read;
+        use QuestionExpression::Write;
+        let shared = Some(StoragelessRefusal::CallbackSharedQuestionId(
+            "EFI_IFR_PASSWORD",
+        ));
+        for expressions in [false, true] {
+            let read_write = match expressions {
+                true => [expression_of(READ), expression_of(WRITE)].concat(),
+                false => Vec::new(),
+            };
+            for (password_id, flags) in [(1, 0x04), (2, 0x04), (1, 0x00)] {
+                let data = storageless_one_of(flags);
+                let one_of = [
+                    operation(ONE_OF, true, &data),
+                    one_of_option(5, 0x00, &[1]),
+                    read_write.clone(),
+                    END.to_vec(),
+                ]
+                .concat();
+                let password = password_on(password_id, 6, 0, 0);
+                let root = parse_form_set(&[form(1, &[one_of, password.clone()])]);
+                let question = find_op(&root, &data).expect("the ONE_OF");
+                let classified = StoragelessQuestion::of(&question).expect("storageless");
+                let password_op = find_op(&root, &password[2..]).expect("the PASSWORD");
+                assert_eq!(
+                    StoragelessQuestion::of(&password_op),
+                    None,
+                    "the PASSWORD is no StoragelessQuestion"
+                );
+                for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+                    let want = match (password_id, flags, expressions) {
+                        (1, 0x04, _) => shared.clone(),
+                        (_, 0x04, false) => Some(StoragelessRefusal::DriverHeld(reach)),
+                        (_, 0x04, true) => Some(StoragelessRefusal::CallbackDecides(Read, reach)),
+                        (_, _, false) => Some(StoragelessRefusal::NoValueSource),
+                        (_, _, true) => None,
+                    };
+                    assert_eq!(
+                        classified.refusal(Read, reach),
+                        want,
+                        "READ: PASSWORD {password_id}, flags {flags:#04x}, expressions \
+                         {expressions}, through {reach:?}"
+                    );
+                    assert_eq!(
+                        classified.shares_question_id(),
+                        (password_id, flags) == (1, 0x04),
+                        "shares: PASSWORD {password_id}, flags {flags:#04x}"
+                    );
+                }
+                if (password_id, flags) == (1, 0x04) {
+                    assert_eq!(
+                        classified.refusal(Write, VariableReach::BootServices),
+                        shared,
+                        "WRITE, expressions {expressions}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Each refusal names what the question lacks or what its driver answered, in UEFI terms.
     #[test]
     fn refusals_say_why_in_uefi_terms() {
@@ -686,7 +850,7 @@ mod tests {
                 StoragelessRefusal::DriverHeld(VariableReach::BootServices),
                 "question has no VarStore; its driver keeps the value, which only \
                  EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 §33.2.5.6), which \
-                 uefisettings.efi does not call yet",
+                 only get (without --no-efivars) and set call",
             ),
             (
                 StoragelessRefusal::CallbackDecides(
@@ -717,8 +881,15 @@ mod tests {
                 ),
                 "question has no VarStore, and its driver's \
                  EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack(EFI_BROWSER_ACTION_RETRIEVE) may replace \
-                 the value of its READ expression (UEFI 2.11 §35.5.4), which uefisettings.efi does \
-                 not call yet",
+                 the value of its READ expression (UEFI 2.11 §35.5.4), which only get (without \
+                 --no-efivars) and set call",
+            ),
+            (
+                StoragelessRefusal::CallbackUndecoded("EFI_IFR_DATE"),
+                "question has no VarStore, and its driver's \
+                 EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() keeps or may change its value (UEFI \
+                 2.11 §33.2.5.6, §35.5.4), which uefisettings exchanges with CallBack() only for \
+                 an EFI_IFR_ONE_OF, EFI_IFR_NUMERIC or EFI_IFR_CHECKBOX, not for an EFI_IFR_DATE",
             ),
             (
                 StoragelessRefusal::ReadOnly,
@@ -750,29 +921,6 @@ mod tests {
                 },
                 "its driver's CallBack(EFI_BROWSER_ACTION_CHANGING) refused the value: \
                  EFI_ACCESS_DENIED",
-            ),
-            (
-                StoragelessRefusal::SnapshotFailed {
-                    var_store_id: 0x1234,
-                    status: "EFI_NOT_FOUND".to_string(),
-                },
-                "cannot snapshot store 0x1234: EFI_NOT_FOUND",
-            ),
-            (
-                StoragelessRefusal::StoresChanged {
-                    stores: vec!["0x0001".to_string(), "0x0002".to_string()],
-                    restore: StoreRestore::Verified,
-                },
-                "the Callback sequence changed stores of the FormSet: 0x0001, 0x0002; restored \
-                 and verified",
-            ),
-            (
-                StoragelessRefusal::StoresChanged {
-                    stores: vec!["0x0001".to_string()],
-                    restore: StoreRestore::Failed("EFI_WRITE_PROTECTED".to_string()),
-                },
-                "the Callback sequence changed stores of the FormSet: 0x0001; restore failed: \
-                 EFI_WRITE_PROTECTED",
             ),
         ];
         for (refusal, want) in cases {
@@ -905,7 +1053,7 @@ mod get_and_set_tests {
                 Rc::clone(&root),
                 &ListTexts::new(&strings, &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut reader,
             )
             .into_iter()
@@ -947,10 +1095,10 @@ mod get_and_set_tests {
             for (prompt, callback, read, write) in QUESTIONS {
                 let refusal = refusal((callback, read, write), QuestionExpression::Write, reach);
                 let mut reader = reader_reaching(reach);
-                let values = VarStoreValues::new(&root, None);
+                let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let selection = find_question_in(
                     &root,
-                    &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
+                    &QuestionMatch::Prompt(&BTreeSet::from([prompt]), MatchTier::Stored),
                     &mut FormSetWalk::new(
                         &ListTexts::new(&strings, &[]),
                         &mut reader,
@@ -975,10 +1123,11 @@ mod get_and_set_tests {
                     },
                     IncludedStates::empty(),
                     &mut reader,
-                    None,
+                    CheckedVarStores::NONE,
                     VolatileWrites::Refuse,
                     PendingOperations::new(UnsafeOperations::Refuse),
                     &WithholdingVariables::new(&variables, WithheldBytes::default()),
+                    &[],
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string());
@@ -1009,47 +1158,116 @@ mod get_and_set_tests {
         }
     }
 
-    /// QuestionDescriptor::storageless_route gives the classifier's routes of a question
-    /// without a VarStore, and nothing for one with a VarStore.
+    /// A DATE or TIME without a VarStore, flagged EFI_IFR_FLAG_CALLBACK, whose option flagged
+    /// DEFAULT gives its standard default, shows that default beside the refusal of its value,
+    /// through either reach: the IFR gives the default, but the driver keeps the value, which
+    /// uefisettings exchanges with no CallBack() for a DATE or TIME; set refuses it.
     #[test]
-    fn descriptors_give_the_routes_of_storageless_questions() {
-        let root = storageless_form_set();
-        let mut reader = reader_reaching(VariableReach::BootServices);
-        let listed: BTreeMap<String, QuestionDescriptor> = list_questions(
-            Rc::clone(&root),
-            &ListTexts::new(&string_packages(), &[]),
-            IncludedStates::empty(),
-            None,
-            &mut reader,
-        )
-        .into_iter()
-        .map(|(question, _)| (question.question.clone(), question))
-        .collect();
-        for (prompt, callback, read, write) in QUESTIONS {
-            let routes = [QuestionExpression::Read, QuestionExpression::Write].map(|expression| {
-                listed
+    fn a_callback_date_or_time_shows_its_option_default_beside_its_refusal() {
+        // EFI_IFR_OPTION_DEFAULT
+        const DEFAULT: u8 = 0x10;
+        let question = |id: u16, op_code, option: Vec<u8>| {
+            let data = [
+                question_header_with(id, 20 + id, 0, 0, QuestionFlags::CALLBACK.bits()),
+                vec![0x00],
+            ]
+            .concat();
+            [operation(op_code, true, &data), option, END.to_vec()].concat()
+        };
+        let root = parse_form_set(&[
+            default_store(0x0000),
+            form(
+                1,
+                &[
+                    question(1, DATE, typed_option(5, DEFAULT, 0x06, &[0xD4, 0x07, 1, 2])),
+                    question(2, TIME, typed_option(5, DEFAULT, 0x05, &[15, 33, 34])),
+                ],
+            ),
+        ]);
+        let strings = vec![en_us_package(
+            [(21, Rc::from("Date")), (22, Rc::from("Time"))]
+                .into_iter()
+                .collect(),
+        )];
+        let cases = [
+            ("Date", "EFI_IFR_DATE", "2004-01-02", "2027-01-02"),
+            ("Time", "EFI_IFR_TIME", "15:33:34", "01:02:03"),
+        ];
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            let mut reader = reader_reaching(reach);
+            let listed: BTreeMap<String, QuestionDescriptor> = list_questions(
+                Rc::clone(&root),
+                &ListTexts::new(&strings, &[]),
+                IncludedStates::empty(),
+                CheckedVarStores::NONE,
+                &mut reader,
+            )
+            .into_iter()
+            .map(|(question, _)| (question.question.clone(), question))
+            .collect();
+            for (prompt, op, default, new_value) in cases {
+                let refusal = StoragelessRefusal::CallbackUndecoded(op);
+                let listed = listed
                     .get(prompt)
-                    .and_then(|descriptor| descriptor.storageless_route(expression))
-            });
-            let want = [(read, write), (write, read)].map(|(this, other)| {
-                Some(match (this, callback, other) {
-                    (true, callback, _) => Ok(StoragelessRoute::Expression { callback }),
-                    (false, true, _) => Ok(StoragelessRoute::DriverCallback),
-                    (false, false, _) => Err(()),
-                })
-            });
-            assert_eq!(
-                routes.map(|route| route.map(|route| route.map_err(|_| ()))),
-                want,
-                "{prompt}"
-            );
+                    .unwrap_or_else(|| panic!("{prompt}: not listed through {reach:?}"));
+                assert_eq!(
+                    listed.value,
+                    format!("<ValueUnavailable: {refusal}> <IFR default: {default}>"),
+                    "{prompt} through {reach:?}"
+                );
+                let defaults: Vec<(DefaultId, String)> = listed
+                    .defaults
+                    .iter()
+                    .map(|declared| (declared.default_id, declared.value.to_string()))
+                    .collect();
+                assert_eq!(
+                    defaults,
+                    [(DefaultId::STANDARD, default.to_string())],
+                    "{prompt} through {reach:?}: defaults"
+                );
+
+                let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
+                let selection = find_question_in(
+                    &root,
+                    &QuestionMatch::Prompt(&BTreeSet::from([prompt]), MatchTier::Stored),
+                    &mut FormSetWalk::new(
+                        &ListTexts::new(&strings, &[]),
+                        &mut reader,
+                        &values,
+                        IncludedStates::empty(),
+                    ),
+                );
+                let Selection::Picked {
+                    picked: (descriptor, _),
+                    ..
+                } = &selection
+                else {
+                    panic!("{prompt}: not picked through {reach:?}");
+                };
+                let variables = MemoryVariables::new(reach, reader.interface());
+                let set = set_questions(
+                    prompt,
+                    &[("selector", descriptor)],
+                    NewAnswer::Text {
+                        text: new_value,
+                        variations: &BTreeSet::from([new_value.to_string()]),
+                    },
+                    IncludedStates::empty(),
+                    &mut reader,
+                    CheckedVarStores::NONE,
+                    VolatileWrites::Refuse,
+                    PendingOperations::new(UnsafeOperations::Refuse),
+                    &WithholdingVariables::new(&variables, WithheldBytes::default()),
+                    &[],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+                assert_eq!(
+                    set,
+                    Err(format!("cannot set question {prompt:?}: {refusal}")),
+                    "{prompt}: set through {reach:?}"
+                );
+            }
         }
-        assert_eq!(
-            listed
-                .get(STORED)
-                .map(|descriptor| descriptor.storageless_route(QuestionExpression::Read)),
-            Some(None),
-            "{STORED}"
-        );
     }
 }

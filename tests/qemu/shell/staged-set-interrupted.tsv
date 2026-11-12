@@ -1,0 +1,10 @@
+# The checks of shell/staged-set-interrupted.nsh. See check-shell-log.sh.
+# the staged set's uefisettings.efi starts and its driver resets the platform in CHANGED, before
+# uefisettings.efi prints anything, after which the firmware loads the drivers again
+firmware	line	^BdsDxe: starting Boot[0-9A-Fa-f]{4} "uefisettings: a set staged for this boot" from HD\(2,GPT,8C78A505-BAA0-4C4A-869F-000000001A10,0x800,0x14000\)/\\EFI\\uefisettings\\uefisettings\.efi$
+firmware	line	^callback-forms: Callback\(CHANGED\) question 0x0102 value 0x1: SUCCESS, resetting the platform$
+firmware	none	^apply-staged:
+firmware	count	2 ^publish-hiidb: registered the callback forms Callbacks$
+# the driver wrote the value before the reset
+get-partly-applied	status	0x0
+get-partly-applied	json-line	.responses | length == 1 and (.[0].question.answer | startswith("On"))

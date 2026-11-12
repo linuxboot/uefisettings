@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "variables": [
+    {
+      "name": "UefisettingsFormSetDisableIf",
+      "guid": "8c78a505-baa0-4c4a-869f-000000002401",
+      "attr": 7,
+      "data": "0001020304000000BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    }
+  ]
+}

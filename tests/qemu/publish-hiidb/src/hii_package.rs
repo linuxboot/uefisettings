@@ -49,9 +49,11 @@ pub(crate) const EFI_IFR_ONE_OF_OPTION_OP: u8 = 0x09;
 pub(crate) const EFI_IFR_SUPPRESS_IF_OP: u8 = 0x0A;
 pub(crate) const EFI_IFR_FORM_SET_OP: u8 = 0x0E;
 pub(crate) const EFI_IFR_REF_OP: u8 = 0x0F;
+pub(crate) const EFI_IFR_EQ_ID_VAL_OP: u8 = 0x12;
 pub(crate) const EFI_IFR_AND_OP: u8 = 0x15;
 pub(crate) const EFI_IFR_DATE_OP: u8 = 0x1A;
 pub(crate) const EFI_IFR_TIME_OP: u8 = 0x1B;
+pub(crate) const EFI_IFR_STRING_OP: u8 = 0x1C;
 pub(crate) const EFI_IFR_DISABLE_IF_OP: u8 = 0x1E;
 pub(crate) const EFI_IFR_MAP_OP: u8 = 0x22;
 pub(crate) const EFI_IFR_ORDERED_LIST_OP: u8 = 0x23;
@@ -262,6 +264,25 @@ pub(crate) fn uint16_numeric(header: Vec<u8>) -> Vec<u8> {
         header,
         UINT16_DECIMAL,
         &[0, u16::MAX, 1].map(u16::to_le_bytes).concat(),
+    )
+}
+
+/// The VARSTORE_NAME_VALUE of `id` whose values are named in the space `guid`.
+pub(crate) fn var_store_name_value_op(id: u16, guid: Guid) -> Vec<u8> {
+    op(
+        EFI_IFR_VARSTORE_NAME_VALUE_OP,
+        false,
+        &[&id.to_le_bytes()[..], &guid.to_bytes()].concat(),
+    )
+}
+
+/// The STRING op (UEFI 2.11 §33.3.8.3.70) whose question header is `header`, of MinSize
+/// `min_size` and MaxSize `max_size` characters and no Flags.
+pub(crate) fn string_op(header: Vec<u8>, min_size: u8, max_size: u8) -> Vec<u8> {
+    op(
+        EFI_IFR_STRING_OP,
+        false,
+        &[&header[..], &[min_size, max_size, 0]].concat(),
     )
 }
 
