@@ -145,7 +145,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       # No rust-cache: its cleanup takes run.sh's initramfs/tests for a cargo
-      # profile and logs errors; the builds take about a minute without it.
+      # profile and logs errors; the builds take about 2.5 minutes without it.
       - run: make setup
 
       # The system's guest packages, DriverSample.efi and Secure Boot firmware, keyed also on
